@@ -1,41 +1,2928 @@
-# Compiled Lua sources
-luac.out
+--!nonstrict
+-- PerfMonitor v4.1 — FPS + analyseur + profileur + correctifs
+-- Interface : noir transparent, sans emoji, sans animation.
+-- Placer dans un LocalScript, enfant d'un ScreenGui (StarterGui > ScreenGui).
+-- Raccourcis : F6 ouvrir/fermer | F7 ré-analyser | F8 enregistrer | Q parent | E enfant
 
-# luarocks build files
-*.src.rock
-*.zip
-*.tar.gz
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local GuiService = game:GetService("GuiService")
+local StatsService = game:GetService("Stats")
 
-# Object files
-*.o
-*.os
-*.ko
-*.obj
-*.elf
+local localPlayer = Players.LocalPlayer
 
-# Precompiled Headers
-*.gch
-*.pch
+local gui = script.Parent
+if not gui:IsA("ScreenGui") then
+	local g = Instance.new("ScreenGui")
+	g.Name = "PerfMonitor"
+	g.Parent = localPlayer:WaitForChild("PlayerGui")
+	gui = g
+end
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-*.def
-*.exp
+-- ===================== THEME =====================
+local C = {
+	Bg = Color3.fromRGB(0, 0, 0),
+	Side = Color3.fromRGB(0, 0, 0),
+	Row = Color3.fromRGB(28, 28, 32),
+	RowHover = Color3.fromRGB(62, 62, 70),
+	Line = Color3.fromRGB(70, 72, 80),
+	Text = Color3.fromRGB(240, 240, 244),
+	Muted = Color3.fromRGB(140, 143, 155),
+	Good = Color3.fromRGB(80, 205, 125),
+	Warn = Color3.fromRGB(240, 175, 65),
+	Bad = Color3.fromRGB(235, 90, 90),
+	Accent = Color3.fromRGB(105, 155, 235),
+	AccentBg = Color3.fromRGB(24, 34, 52),
+}
+local PALETTE = {
+	Color3.fromRGB(105, 155, 235),
+	Color3.fromRGB(160, 125, 240),
+	Color3.fromRGB(80, 205, 150),
+	Color3.fromRGB(245, 150, 70),
+	Color3.fromRGB(238, 110, 165),
+	Color3.fromRGB(235, 235, 240),
+}
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
+local FONT_REG = Enum.Font.Gotham
+local FONT_MED = Enum.Font.GothamMedium
+local FONT_SEMI = Enum.Font.GothamSemibold
+local FONT_BOLD = Enum.Font.GothamBold
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+local ROW_T = 0.55 -- transparence des cartes / boutons (effet verre noir)
 
+local PANEL_W, PANEL_H = 540, 690
+local BAR_W, BAR_H = 400, 56
+local SIDE_W = 84
+local MAX_MARKERS = 300
+local SEV = { 0.6, 1, 1.6 }
+local SEV_NAMES = { "Strict", "Normal", "Souple" }
+
+local V, SY, B, R, X, U = {}, {}, {}, {}, {}, {}
+
+-- Réglages utilisateur
+local S = {
+	uiMul = 1,
+	opacity = 0.7,
+	compact = false,
+	severity = 2,
+	hoverHL = true,
+	selHL = true,
+	ignorePlayers = true,
+	alerts = true,
+	alertFps = 30,
+}
+
+-- ===================== HELPERS =====================
+local function isGlass(c)
+	return c == C.Row or c == C.RowHover or c == C.Bg or c == C.Side or c == C.AccentBg
+end
+
+local function make(className, props, children)
+	local inst = Instance.new(className)
+	for k, v in pairs(props) do
+		if k ~= "Parent" then
+			inst[k] = v
+		end
+	end
+	if inst:IsA("GuiObject") and props.BackgroundColor3 and props.BackgroundTransparency == nil
+		and isGlass(props.BackgroundColor3) then
+		inst.BackgroundTransparency = ROW_T
+	end
+	if children then
+		for _, ch in ipairs(children) do
+			ch.Parent = inst
+		end
+	end
+	if props.Parent then
+		inst.Parent = props.Parent
+	end
+	return inst
+end
+
+local function corner(r)
+	return make("UICorner", { CornerRadius = UDim.new(0, r) })
+end
+
+local function stroke(col, t, th)
+	local isLine = col == C.Line
+	return make("UIStroke", {
+		Color = if isLine then Color3.new(1, 1, 1) else col,
+		Transparency = if t >= 1 then 1 elseif isLine then 0.9 else t,
+		Thickness = th or 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+end
+
+local function lbl(props)
+	local p = {
+		BackgroundTransparency = 1,
+		Font = FONT_REG,
+		TextSize = 13,
+		TextColor3 = C.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}
+	for k, v in pairs(props) do
+		p[k] = v
+	end
+	return make("TextLabel", p)
+end
+
+-- Aucune animation : les changements sont appliqués instantanément.
+local function tw(inst, props)
+	for k, v in pairs(props) do
+		inst[k] = v
+	end
+end
+
+local function rowBase() return C.Row end
+local function rowHover() return C.RowHover end
+
+local function hoverFx(btn, baseFn, hoverFn)
+	btn.MouseEnter:Connect(function() btn.BackgroundColor3 = hoverFn() end)
+	btn.MouseLeave:Connect(function() btn.BackgroundColor3 = baseFn() end)
+end
+
+-- Registre des éléments liés à la couleur d'accent
+local accentCallbacks = {}
+local function bindAccent(fn)
+	table.insert(accentCallbacks, fn)
+	fn()
+end
+local function setAccent(col)
+	C.Accent = col
+	C.AccentBg = col:Lerp(C.Bg, 0.82)
+	for _, fn in ipairs(accentCallbacks) do
+		fn()
+	end
+end
+
+local function scoreColor(s)
+	return if s >= 75 then C.Good elseif s >= 45 then C.Warn else C.Bad
+end
+local function scoreVerdict(s)
+	return if s >= 75 then "OPTIMISÉ" elseif s >= 45 then "MOYEN" else "NON OPTIMISÉ"
+end
+local function colorFor(v, warn, bad)
+	return if v > bad then C.Bad elseif v > warn then C.Warn else C.Text
+end
+local function fpsColor(fps)
+	return if fps >= 50 then C.Good elseif fps >= 30 then C.Warn else C.Bad
+end
+
+-- ===================== NETTOYAGE =====================
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 50
+
+for _, child in ipairs(gui:GetChildren()) do
+	if child ~= script then child:Destroy() end
+end
+for _, n in ipairs({ "PerfMonitorMarkers", "PerfMonitorHighlights" }) do
+	local o = Workspace:FindFirstChild(n)
+	if o then o:Destroy() end
+end
+local markersFolder = make("Folder", { Name = "PerfMonitorMarkers", Parent = Workspace })
+local hlFolder = make("Folder", { Name = "PerfMonitorHighlights", Parent = Workspace })
+
+-- ===================== ETAT =====================
+local isPanelOpen = false
+local isPicking = false
+local hoveredModel, hoverChain, hoverIdx = nil, nil, 1
+local selected, selChain, selIdx = nil, nil, 1
+local analysisToken = 0
+local rankToken = 0
+local rankScanning = false
+local activeRow = nil
+local testing = false
+local hiddenState = nil
+local lastScan = nil
+local undoStack = {}
+local currentTab = "model"
+local history = {}
+local HIST_MAX = 120
+local conns = {}
+local function G(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(conns, c)
+	return c
+end
+
+local setTab, togglePanel, analyze, setPicking, layoutPanel, applyScale, applyCompact
+local toast, refreshOpti, refreshPick, updateNavButtons, updateActions
+
+-- ===================== ROOT + BARRE FPS =====================
+local root = make("Frame", {
+	Name = "RootContainer",
+	Size = UDim2.fromOffset(PANEL_W, BAR_H),
+	Position = UDim2.new(1, -20, 0, 64),
+	AnchorPoint = Vector2.new(1, 0),
+	BackgroundTransparency = 1,
+	Parent = gui,
+})
+local uiScale = make("UIScale", { Parent = root })
+
+local fpsBar = make("Frame", {
+	Name = "FpsBar",
+	Size = UDim2.fromOffset(BAR_W, BAR_H),
+	Position = UDim2.fromScale(1, 0),
+	AnchorPoint = Vector2.new(1, 0),
+	BackgroundColor3 = C.Bg,
+	BackgroundTransparency = 0.3,
+	Active = true,
+	Parent = root,
+}, { corner(12), stroke(C.Line, 0.1, 1) })
+
+local fpsStroke = fpsBar:FindFirstChildOfClass("UIStroke")
+
+local statusDot = make("Frame", {
+	Size = UDim2.fromOffset(8, 8),
+	Position = UDim2.new(0, 16, 0.5, 0),
+	AnchorPoint = Vector2.new(0, 0.5),
+	BackgroundColor3 = C.Good,
+	Parent = fpsBar,
+}, { corner(4) })
+
+local fpsLabel = lbl({
+	Size = UDim2.fromOffset(92, 28),
+	Position = UDim2.new(0, 32, 0.5, 0),
+	AnchorPoint = Vector2.new(0, 0.5),
+	Font = FONT_BOLD,
+	TextSize = 21,
+	Text = "-- FPS",
+	Parent = fpsBar,
+})
+
+local msLabel = lbl({
+	Size = UDim2.fromOffset(56, 20),
+	Position = UDim2.new(0, 124, 0.5, 0),
+	AnchorPoint = Vector2.new(0, 0.5),
+	TextSize = 12,
+	TextColor3 = C.Muted,
+	Text = "-- ms",
+	Parent = fpsBar,
+})
+
+local SPARK_N = 22
+local spark = make("Frame", {
+	Size = UDim2.fromOffset(72, 24),
+	Position = UDim2.new(0, 184, 0.5, 0),
+	AnchorPoint = Vector2.new(0, 0.5),
+	BackgroundTransparency = 1,
+	Parent = fpsBar,
+})
+local sparkBars = {}
+for i = 1, SPARK_N do
+	sparkBars[i] = make("Frame", {
+		Size = UDim2.new(1 / SPARK_N, -1, 0, 0),
+		Position = UDim2.new((i - 1) / SPARK_N, 0, 1, 0),
+		AnchorPoint = Vector2.new(0, 1),
+		BackgroundColor3 = C.Good,
+		BorderSizePixel = 0,
+		Parent = spark,
+	})
+end
+
+local optiBtn = make("TextButton", {
+	Name = "OptiButton",
+	Size = UDim2.fromOffset(118, 36),
+	Position = UDim2.new(1, -10, 0.5, 0),
+	AnchorPoint = Vector2.new(1, 0.5),
+	AutoButtonColor = false,
+	Font = FONT_SEMI,
+	TextSize = 13,
+	Text = "Opti Modèle",
+	BackgroundColor3 = C.AccentBg,
+	TextColor3 = C.Accent,
+	Parent = fpsBar,
+}, { corner(9) })
+local optiStroke = stroke(C.Accent, 0.6, 1)
+optiStroke.Parent = optiBtn
+
+-- ===================== PANNEAU (CanvasGroup) =====================
+local panel = make("CanvasGroup", {
+	Name = "InspectorPanel",
+	Size = UDim2.fromOffset(PANEL_W, PANEL_H),
+	Position = UDim2.new(1, 0, 0, BAR_H + 8),
+	AnchorPoint = Vector2.new(1, 0),
+	BackgroundColor3 = C.Bg,
+	BackgroundTransparency = 0.3,
+	GroupTransparency = 0,
+	Visible = false,
+	Active = true,
+	Parent = root,
+}, { corner(14), stroke(C.Line, 0.05, 1) })
+
+-- Sidebar
+local sidebar = make("Frame", {
+	Size = UDim2.new(0, SIDE_W, 1, 0),
+	BackgroundColor3 = C.Side,
+	BackgroundTransparency = 0.45,
+	BorderSizePixel = 0,
+	Parent = panel,
+})
+make("Frame", {
+	Size = UDim2.new(0, 1, 1, 0),
+	Position = UDim2.new(1, -1, 0, 0),
+	BackgroundColor3 = Color3.new(1, 1, 1),
+	BackgroundTransparency = 0.92,
+	BorderSizePixel = 0,
+	Parent = sidebar,
+})
+local logo = lbl({
+	Size = UDim2.new(1, 0, 0, 56),
+	Font = FONT_BOLD,
+	TextSize = 14,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	Text = "PERF",
+	Parent = sidebar,
+})
+local sideList = make("Frame", {
+	Size = UDim2.new(1, 0, 1, -110),
+	Position = UDim2.fromOffset(0, 64),
+	BackgroundTransparency = 1,
+	Parent = sidebar,
+}, {
+	make("UIListLayout", {
+		Padding = UDim.new(0, 4),
+		HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+lbl({
+	Size = UDim2.new(1, 0, 0, 16),
+	Position = UDim2.new(0, 0, 1, -24),
+	TextSize = 10,
+	TextColor3 = C.Muted,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	Text = "v4.1",
+	Parent = sidebar,
+})
+
+-- Header (zone de drag)
+local header = make("Frame", {
+	Size = UDim2.new(1, -SIDE_W, 0, 62),
+	Position = UDim2.fromOffset(SIDE_W, 0),
+	BackgroundTransparency = 1,
+	Active = true,
+	Parent = panel,
+})
+local headerTitle = lbl({
+	Size = UDim2.new(1, -70, 0, 26),
+	Position = UDim2.fromOffset(16, 10),
+	Font = FONT_BOLD,
+	TextSize = 17,
+	Text = "Analyse du modèle",
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = header,
+})
+local headerSub = lbl({
+	Size = UDim2.new(1, -70, 0, 16),
+	Position = UDim2.fromOffset(16, 36),
+	TextSize = 11,
+	TextColor3 = C.Muted,
+	Text = "",
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = header,
+})
+local closeBtn = make("TextButton", {
+	Size = UDim2.fromOffset(32, 32),
+	Position = UDim2.new(1, -12, 0, 15),
+	AnchorPoint = Vector2.new(1, 0),
+	BackgroundColor3 = C.Row,
+	AutoButtonColor = false,
+	Font = FONT_SEMI,
+	TextSize = 13,
+	TextColor3 = C.Muted,
+	Text = "X",
+	Parent = header,
+}, { corner(8) })
+hoverFx(closeBtn, rowBase, rowHover)
+
+make("Frame", {
+	Size = UDim2.new(1, -SIDE_W - 28, 0, 1),
+	Position = UDim2.fromOffset(SIDE_W + 14, 62),
+	BackgroundColor3 = Color3.new(1, 1, 1),
+	BackgroundTransparency = 0.92,
+	BorderSizePixel = 0,
+	Parent = panel,
+})
+
+-- Toast
+local toastFrame = make("Frame", {
+	Size = UDim2.fromOffset(360, 36),
+	Position = UDim2.new(0.5, SIDE_W / 2, 1, -14),
+	AnchorPoint = Vector2.new(0.5, 1),
+	BackgroundColor3 = Color3.new(0, 0, 0),
+	BackgroundTransparency = 0.15,
+	Visible = false,
+	ZIndex = 30,
+	Parent = panel,
+}, { corner(9), stroke(C.Line, 0.3, 1) })
+local toastLabel = lbl({
+	Size = UDim2.fromScale(1, 1),
+	Font = FONT_MED,
+	TextSize = 12,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	ZIndex = 31,
+	Parent = toastFrame,
+})
+local toastToken = 0
+toast = function(text, color)
+	toastToken += 1
+	local t = toastToken
+	toastLabel.Text = text
+	toastLabel.TextColor3 = color or C.Text
+	toastFrame.Visible = true
+	task.delay(2.8, function()
+		if t == toastToken then
+			toastFrame.Visible = false
+		end
+	end)
+end
+
+-- Pages
+local PAGE_W = -SIDE_W - 28
+local function newPage()
+	return make("ScrollingFrame", {
+		Size = UDim2.new(1, PAGE_W, 1, -78),
+		Position = UDim2.fromOffset(SIDE_W + 14, 72),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = C.Line,
+		CanvasSize = UDim2.fromOffset(0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Visible = false,
+		Parent = panel,
+	}, {
+		make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+		make("UIPadding", { PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 40), PaddingTop = UDim.new(0, 2) }),
+	})
+end
+local pages = { model = newPage(), rank = newPage(), system = newPage(), live = newPage(), settings = newPage() }
+
+-- Onglets (texte seul)
+local TAB_DEFS = {
+	{ id = "model", name = "Analyse", title = "Analyse du modèle", sub = "Ciblez un modèle pour mesurer son coût" },
+	{ id = "rank", name = "Top", title = "Classement des modèles", sub = "Les modèles les plus lourds de la map" },
+	{ id = "system", name = "Système", title = "Performances système", sub = "FPS, mémoire, réseau, physique" },
+	{ id = "live", name = "Profil", title = "Profileur en direct", sub = "Mémoire, pics de frame, enregistrement" },
+	{ id = "settings", name = "Réglages", title = "Réglages", sub = "Interface et seuils d'analyse" },
+}
+local tabs = {}
+for i, def in ipairs(TAB_DEFS) do
+	local btn = make("TextButton", {
+		LayoutOrder = i,
+		Size = UDim2.fromOffset(72, 38),
+		BackgroundColor3 = C.AccentBg,
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		Font = FONT_SEMI,
+		TextSize = 12,
+		Text = def.name,
+		Parent = sideList,
+	}, { corner(9) })
+	local ind = make("Frame", {
+		Size = UDim2.fromOffset(3, 18),
+		Position = UDim2.new(0, -6, 0.5, 0),
+		AnchorPoint = Vector2.new(0, 0.5),
+		BorderSizePixel = 0,
+		Parent = btn,
+	}, { corner(2) })
+	tabs[def.id] = { btn = btn, ind = ind }
+	btn.MouseButton1Click:Connect(function() setTab(def.id) end)
+	btn.MouseEnter:Connect(function()
+		if currentTab ~= def.id then btn.BackgroundTransparency = 0.8 end
+	end)
+	btn.MouseLeave:Connect(function()
+		if currentTab ~= def.id then btn.BackgroundTransparency = 1 end
+	end)
+end
+
+local function refreshTabs()
+	for id, t in pairs(tabs) do
+		local active = id == currentTab
+		t.btn.BackgroundColor3 = C.AccentBg
+		t.btn.BackgroundTransparency = if active then 0.3 else 1
+		t.ind.BackgroundColor3 = C.Accent
+		t.ind.Visible = active
+		t.btn.TextColor3 = if active then C.Accent else C.Muted
+	end
+	logo.TextColor3 = C.Accent
+end
+bindAccent(refreshTabs)
+
+-- ===================== PAGE ANALYSE : UI =====================
+local pageModel = pages.model
+
+local function newGrid(parent, order, cols, rows, cellH)
+	local gap = 8
+	return make("Frame", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = parent,
+	}, {
+		make("UIGridLayout", {
+			CellSize = UDim2.new(1 / cols, -math.ceil(gap * (cols - 1) / cols) - 1, 0, cellH),
+			CellPadding = UDim2.fromOffset(gap, gap),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+end
+
+local function tileCell(grid, order, title)
+	local cell = make("Frame", { LayoutOrder = order, BackgroundColor3 = C.Row, ClipsDescendants = true, Parent = grid }, { corner(9), stroke(C.Line, 0.5, 1) })
+	local val = lbl({
+		Size = UDim2.new(1, -20, 0, 26),
+		Position = UDim2.fromOffset(12, 7),
+		Font = FONT_BOLD,
+		TextSize = 18,
+		Text = "-",
+		Parent = cell,
+	})
+	lbl({
+		Size = UDim2.new(1, -20, 0, 14),
+		Position = UDim2.fromOffset(12, 35),
+		TextSize = 10,
+		TextColor3 = C.Muted,
+		Text = title,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = cell,
+	})
+	return val
+end
+
+-- Barre d'outils
+local toolbar = make("Frame", {
+	LayoutOrder = 1,
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundTransparency = 1,
+	Parent = pageModel,
+}, {
+	make("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+local function toolBtn(order, w, text)
+	return make("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.fromOffset(w, 40),
+		BackgroundColor3 = C.Row,
+		AutoButtonColor = false,
+		Font = FONT_SEMI,
+		TextSize = 12,
+		TextColor3 = C.Text,
+		Text = text,
+		Parent = toolbar,
+	}, { corner(9), stroke(C.Line, 0.5, 1) })
+end
+B.pick = toolBtn(1, 104, "Cibler")
+B.up = toolBtn(2, 76, "Parent")
+B.down = toolBtn(3, 76, "Enfant")
+B.world = toolBtn(4, 130, "Tout le monde")
+hoverFx(B.up, rowBase, rowHover)
+hoverFx(B.down, rowBase, rowHover)
+hoverFx(B.world, rowBase, rowHover)
+
+X.banner = lbl({
+	LayoutOrder = 2,
+	Size = UDim2.new(1, 0, 0, 34),
+	BackgroundTransparency = ROW_T,
+	BackgroundColor3 = C.Row,
+	Font = FONT_MED,
+	TextSize = 12,
+	TextColor3 = C.Muted,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Text = "Cliquez sur « Cibler » puis sur un modèle du monde.",
+	Parent = pageModel,
+})
+make("UICorner", { CornerRadius = UDim.new(0, 9), Parent = X.banner })
+make("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14), Parent = X.banner })
+
+X.progTrack = make("Frame", {
+	LayoutOrder = 3,
+	Size = UDim2.new(1, 0, 0, 3),
+	BackgroundColor3 = C.Row,
+	BorderSizePixel = 0,
+	Visible = false,
+	Parent = pageModel,
+}, { corner(2) })
+X.progFill = make("Frame", {
+	Size = UDim2.fromScale(0, 1),
+	BorderSizePixel = 0,
+	Parent = X.progTrack,
+}, { corner(2) })
+bindAccent(function() X.progFill.BackgroundColor3 = C.Accent end)
+
+-- Carte résultat
+U.resultCard = make("Frame", {
+	LayoutOrder = 4,
+	Size = UDim2.new(1, 0, 0, 116),
+	BackgroundColor3 = C.Row,
+	Parent = pageModel,
+}, { corner(12), stroke(C.Line, 0.4, 1) })
+U.name = lbl({
+	Size = UDim2.new(1, -140, 0, 24),
+	Position = UDim2.fromOffset(16, 10),
+	Font = FONT_SEMI,
+	TextSize = 16,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Text = "Aucun modèle sélectionné",
+	Parent = U.resultCard,
+})
+U.path = lbl({
+	Size = UDim2.new(1, -140, 0, 16),
+	Position = UDim2.fromOffset(16, 36),
+	TextSize = 10,
+	TextColor3 = C.Muted,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Text = "Survolez un modèle dans le monde",
+	Parent = U.resultCard,
+})
+U.info = lbl({
+	Size = UDim2.new(1, -140, 0, 16),
+	Position = UDim2.fromOffset(16, 56),
+	TextSize = 11,
+	TextColor3 = C.Muted,
+	Text = "-",
+	Parent = U.resultCard,
+})
+U.score = lbl({
+	Size = UDim2.fromOffset(110, 42),
+	Position = UDim2.new(1, -16, 0, 8),
+	AnchorPoint = Vector2.new(1, 0),
+	Font = FONT_BOLD,
+	TextSize = 36,
+	TextColor3 = C.Muted,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	Text = "--",
+	Parent = U.resultCard,
+})
+U.verdict = lbl({
+	Size = UDim2.fromOffset(120, 18),
+	Position = UDim2.new(1, -16, 0, 52),
+	AnchorPoint = Vector2.new(1, 0),
+	Font = FONT_BOLD,
+	TextSize = 11,
+	TextColor3 = C.Muted,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	Text = "EN ATTENTE",
+	Parent = U.resultCard,
+})
+U.scoreTrack = make("Frame", {
+	Size = UDim2.new(1, -32, 0, 6),
+	Position = UDim2.fromOffset(16, 94),
+	BackgroundColor3 = Color3.new(1, 1, 1),
+	BackgroundTransparency = 0.9,
+	BorderSizePixel = 0,
+	Parent = U.resultCard,
+}, { corner(3) })
+U.scoreFill = make("Frame", {
+	Size = UDim2.fromScale(0, 1),
+	BackgroundColor3 = C.Muted,
+	BorderSizePixel = 0,
+	Parent = U.scoreTrack,
+}, { corner(3) })
+
+-- Actions
+local actions = make("Frame", {
+	LayoutOrder = 5,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	Parent = pageModel,
+}, {
+	make("UIGridLayout", {
+		CellSize = UDim2.new(1 / 3, -7, 0, 38),
+		CellPadding = UDim2.fromOffset(8, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+local function actBtn(order, text)
+	local b = make("TextButton", {
+		LayoutOrder = order,
+		BackgroundColor3 = C.Row,
+		AutoButtonColor = false,
+		Font = FONT_SEMI,
+		TextSize = 12,
+		TextColor3 = C.Text,
+		Text = text,
+		Parent = actions,
+	}, { corner(9), stroke(C.Line, 0.5, 1) })
+	hoverFx(b, rowBase, rowHover)
+	return b
+end
+B.test = actBtn(1, "Impact")
+B.hide = actBtn(2, "Masquer")
+B.report = actBtn(3, "Rapport")
+B.redo = actBtn(4, "Refaire")
+B.fixall = actBtn(5, "Tout corriger")
+B.undo = actBtn(6, "Annuler")
+
+X.impactCard = make("Frame", {
+	LayoutOrder = 6,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundColor3 = C.Row,
+	Visible = false,
+	Parent = pageModel,
+}, { corner(10), stroke(C.Line, 0.4, 1) })
+X.impactLabel = lbl({
+	Size = UDim2.new(1, -28, 0, 0),
+	Position = UDim2.fromOffset(14, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	TextWrapped = true,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	RichText = true,
+	TextSize = 12,
+	Text = "",
+	Parent = X.impactCard,
+})
+make("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12), Parent = X.impactLabel })
+
+X.reportCard = make("Frame", {
+	LayoutOrder = 7,
+	Size = UDim2.new(1, 0, 0, 200),
+	BackgroundColor3 = C.Row,
+	Visible = false,
+	Parent = pageModel,
+}, { corner(10), stroke(C.Line, 0.4, 1) })
+lbl({
+	Size = UDim2.new(1, -24, 0, 16),
+	Position = UDim2.fromOffset(12, 8),
+	TextSize = 10,
+	TextColor3 = C.Muted,
+	Text = "Sélectionnez le texte (Ctrl+A) puis copiez-le (Ctrl+C)",
+	Parent = X.reportCard,
+})
+X.reportBox = make("TextBox", {
+	Size = UDim2.new(1, -24, 1, -34),
+	Position = UDim2.fromOffset(12, 26),
+	BackgroundColor3 = Color3.new(0, 0, 0),
+	BackgroundTransparency = 0.3,
+	ClearTextOnFocus = false,
+	MultiLine = true,
+	TextEditable = true,
+	TextWrapped = true,
+	Font = Enum.Font.Code,
+	TextSize = 11,
+	TextColor3 = C.Text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	Text = "",
+	Parent = X.reportCard,
+}, { corner(8), make("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }) })
+
+-- Métriques
+U.metricsGrid = newGrid(pageModel, 8, 3, 5, 58)
+V.parts = tileCell(U.metricsGrid, 1, "Pièces")
+V.meshes = tileCell(U.metricsGrid, 2, "MeshParts")
+V.unions = tileCell(U.metricsGrid, 3, "Unions CSG")
+V.uniq = tileCell(U.metricsGrid, 4, "MeshIds uniques")
+V.shadows = tileCell(U.metricsGrid, 5, "Ombres (CastShadow)")
+V.precise = tileCell(U.metricsGrid, 6, "Col. précises")
+V.unanch = tileCell(U.metricsGrid, 7, "Non-ancrées")
+V.touch = tileCell(U.metricsGrid, 8, "Touch/Query inutiles")
+V.transp = tileCell(U.metricsGrid, 9, "Transparentes")
+V.lights = tileCell(U.metricsGrid, 10, "Lumières (ombres)")
+V.fx = tileCell(U.metricsGrid, 11, "Particules / FX")
+V.scripts = tileCell(U.metricsGrid, 12, "Scripts actifs")
+V.guis = tileCell(U.metricsGrid, 13, "SurfaceGuis")
+V.joints = tileCell(U.metricsGrid, 14, "Joints / Contraintes")
+V.decals = tileCell(U.metricsGrid, 15, "Decals / Textures")
+
+local issuesHeader = make("Frame", {
+	LayoutOrder = 9,
+	Size = UDim2.new(1, 0, 0, 20),
+	BackgroundTransparency = 1,
+	Parent = pageModel,
+})
+lbl({
+	Size = UDim2.new(0.5, 0, 1, 0),
+	Font = FONT_BOLD,
+	TextSize = 11,
+	TextColor3 = C.Muted,
+	Text = "PROBLÈMES DÉTECTÉS",
+	Parent = issuesHeader,
+})
+lbl({
+	Size = UDim2.new(0.5, 0, 1, 0),
+	Position = UDim2.fromScale(0.5, 0),
+	TextSize = 10,
+	TextColor3 = C.Muted,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	Text = "cliquez pour voir les pièces en 3D",
+	Parent = issuesHeader,
+})
+U.issuesList = make("Frame", {
+	LayoutOrder = 10,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	Parent = pageModel,
+}, { make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
+
+-- ===================== PAGE CLASSEMENT : UI =====================
+local pageRank = pages.rank
+R.controls = make("Frame", {
+	LayoutOrder = 1,
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundTransparency = 1,
+	Parent = pageRank,
+}, {
+	make("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+local function rankBtn(order, w, text)
+	return make("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.fromOffset(w, 40),
+		BackgroundColor3 = C.Row,
+		AutoButtonColor = false,
+		Font = FONT_SEMI,
+		TextSize = 12,
+		TextColor3 = C.Text,
+		Text = text,
+		Parent = R.controls,
+	}, { corner(9), stroke(C.Line, 0.5, 1) })
+end
+R.scan = rankBtn(1, 140, "Scanner la map")
+R.sortScore = rankBtn(2, 116, "Pires scores")
+R.sortParts = rankBtn(3, 126, "Plus de pièces")
+
+R.search = make("TextBox", {
+	LayoutOrder = 2,
+	Size = UDim2.new(1, 0, 0, 36),
+	BackgroundColor3 = C.Row,
+	ClearTextOnFocus = false,
+	Font = FONT_MED,
+	TextSize = 12,
+	TextColor3 = C.Text,
+	PlaceholderText = "Filtrer par nom ou chemin…",
+	PlaceholderColor3 = C.Muted,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "",
+	Parent = pageRank,
+}, { corner(9), stroke(C.Line, 0.5, 1), make("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }) })
+
+R.status = lbl({
+	LayoutOrder = 3,
+	Size = UDim2.new(1, 0, 0, 34),
+	BackgroundTransparency = ROW_T,
+	BackgroundColor3 = C.Row,
+	Font = FONT_MED,
+	TextSize = 12,
+	TextColor3 = C.Muted,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Text = "Lancez un scan pour trouver les modèles les plus lourds.",
+	Parent = pageRank,
+})
+make("UICorner", { CornerRadius = UDim.new(0, 9), Parent = R.status })
+make("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14), Parent = R.status })
+
+R.track = make("Frame", {
+	LayoutOrder = 4,
+	Size = UDim2.new(1, 0, 0, 3),
+	BackgroundColor3 = C.Row,
+	BorderSizePixel = 0,
+	Visible = false,
+	Parent = pageRank,
+}, { corner(2) })
+R.fill = make("Frame", { Size = UDim2.fromScale(0, 1), BorderSizePixel = 0, Parent = R.track }, { corner(2) })
+bindAccent(function() R.fill.BackgroundColor3 = C.Accent end)
+
+R.list = make("Frame", {
+	LayoutOrder = 5,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	Parent = pageRank,
+}, { make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
+
+local rankResults = {}
+local rankSort = "score"
+local function refreshRankSort()
+	R.sortScore.BackgroundColor3 = if rankSort == "score" then C.AccentBg else C.Row
+	R.sortScore.TextColor3 = if rankSort == "score" then C.Accent else C.Text
+	R.sortParts.BackgroundColor3 = if rankSort == "parts" then C.AccentBg else C.Row
+	R.sortParts.TextColor3 = if rankSort == "parts" then C.Accent else C.Text
+end
+bindAccent(refreshRankSort)
+hoverFx(R.scan, rowBase, rowHover)
+
+-- ===================== PAGE SYSTEME : UI =====================
+local pageSystem = pages.system
+local graphCard = make("Frame", {
+	LayoutOrder = 1,
+	Size = UDim2.new(1, 0, 0, 200),
+	BackgroundColor3 = C.Row,
+	Parent = pageSystem,
+}, { corner(12), stroke(C.Line, 0.4, 1) })
+lbl({
+	Size = UDim2.new(1, -24, 0, 24),
+	Position = UDim2.fromOffset(14, 8),
+	Font = FONT_SEMI,
+	TextSize = 11,
+	TextColor3 = C.Muted,
+	Text = "FPS — 30 dernières secondes",
+	Parent = graphCard,
+})
+local graphArea = make("Frame", {
+	Size = UDim2.new(1, -28, 1, -50),
+	Position = UDim2.fromOffset(14, 36),
+	BackgroundTransparency = 1,
+	ClipsDescendants = true,
+	Parent = graphCard,
+})
+local GRAPH_MAX, GRAPH_N = 70, 60
+for _, ref in ipairs({ 60, 30 }) do
+	make("Frame", {
+		Size = UDim2.new(1, 0, 0, 1),
+		Position = UDim2.new(0, 0, 1 - ref / GRAPH_MAX, 0),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 0.88,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+		Parent = graphArea,
+	})
+	lbl({
+		Size = UDim2.fromOffset(24, 12),
+		Position = UDim2.new(1, -2, 1 - ref / GRAPH_MAX, -12),
+		AnchorPoint = Vector2.new(1, 0),
+		TextSize = 9,
+		TextColor3 = C.Muted,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		ZIndex = 3,
+		Text = tostring(ref),
+		Parent = graphArea,
+	})
+end
+local bars = {}
+for i = 1, GRAPH_N do
+	bars[i] = make("Frame", {
+		Size = UDim2.new(1 / GRAPH_N, -1, 0, 0),
+		Position = UDim2.new((i - 1) / GRAPH_N, 0, 1, 0),
+		AnchorPoint = Vector2.new(0, 1),
+		BackgroundColor3 = C.Good,
+		BorderSizePixel = 0,
+		Parent = graphArea,
+	})
+end
+
+local sysGrid = newGrid(pageSystem, 2, 3, 4, 58)
+SY.avg = tileCell(sysGrid, 1, "FPS moyen")
+SY.low = tileCell(sysGrid, 2, "1% bas")
+SY.min = tileCell(sysGrid, 3, "FPS min")
+SY.max = tileCell(sysGrid, 4, "FPS max")
+SY.frame = tileCell(sysGrid, 5, "Temps de frame")
+SY.ping = tileCell(sysGrid, 6, "Ping")
+SY.mem = tileCell(sysGrid, 7, "Mémoire client")
+SY.inst = tileCell(sysGrid, 8, "Instances")
+SY.phys = tileCell(sysGrid, 9, "Pas physique")
+SY.prim = tileCell(sysGrid, 10, "Primitives")
+SY.moving = tileCell(sysGrid, 11, "Primitives mobiles")
+SY.qual = tileCell(sysGrid, 12, "Qualité graphique")
+
+local adviceCard = make("Frame", {
+	LayoutOrder = 3,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundColor3 = C.Row,
+	Parent = pageSystem,
+}, { corner(12), stroke(C.Line, 0.4, 1) })
+local adviceLabel = lbl({
+	Size = UDim2.new(1, -28, 0, 0),
+	Position = UDim2.fromOffset(14, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	TextWrapped = true,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	TextSize = 12,
+	Text = "Collecte des données…",
+	Parent = adviceCard,
+})
+make("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12), Parent = adviceLabel })
+
+local function updateGraph()
+	for i = 1, GRAPH_N do
+		local v = history[#history - GRAPH_N + i]
+		local bar = bars[i]
+		if v then
+			bar.Size = UDim2.new(1 / GRAPH_N, -1, math.clamp(v / GRAPH_MAX, 0.02, 1), 0)
+			bar.BackgroundColor3 = fpsColor(v)
+		else
+			bar.Size = UDim2.new(1 / GRAPH_N, -1, 0, 0)
+		end
+	end
+end
+
+local function updateSystemStats()
+	if #history == 0 then return end
+	local sum, mn, mx = 0, math.huge, 0
+	for _, v in ipairs(history) do
+		sum += v
+		mn = math.min(mn, v)
+		mx = math.max(mx, v)
+	end
+	local avg = sum / #history
+	local sorted = table.clone(history)
+	table.sort(sorted)
+	local take = math.max(1, math.ceil(#sorted * 0.01))
+	local lowSum = 0
+	for i = 1, take do lowSum += sorted[i] end
+	local low = lowSum / take
+
+	SY.avg.Text = string.format("%.0f", avg)
+	SY.avg.TextColor3 = fpsColor(avg)
+	SY.low.Text = string.format("%.0f", low)
+	SY.low.TextColor3 = fpsColor(low)
+	SY.min.Text = string.format("%.0f", mn)
+	SY.max.Text = string.format("%.0f", mx)
+	SY.frame.Text = string.format("%.1f ms", 1000 / math.max(avg, 1))
+
+	local okP, ping = pcall(function() return localPlayer:GetNetworkPing() * 1000 end)
+	SY.ping.Text = if okP then string.format("%.0f ms", ping) else "n/a"
+	if okP then SY.ping.TextColor3 = if ping < 100 then C.Good elseif ping < 200 then C.Warn else C.Bad end
+
+	local ok, v = pcall(function() return StatsService:GetTotalMemoryUsageMb() end)
+	SY.mem.Text = if ok then string.format("%.0f MB", v) else "n/a"
+	ok, v = pcall(function() return StatsService.InstanceCount end)
+	SY.inst.Text = if ok then tostring(v) else "n/a"
+	ok, v = pcall(function() return StatsService.PhysicsStepTimeMs end)
+	SY.phys.Text = if ok then string.format("%.1f ms", v) else "n/a"
+	ok, v = pcall(function() return StatsService.PrimitivesCount end)
+	SY.prim.Text = if ok then tostring(v) else "n/a"
+	ok, v = pcall(function() return StatsService.MovingPrimitivesCount end)
+	SY.moving.Text = if ok then tostring(v) else "n/a"
+	ok, v = pcall(function() return settings().Rendering.QualityLevel.Value end)
+	SY.qual.Text = if ok then tostring(v) else "Auto"
+
+	local text
+	if avg >= 55 and low >= 45 then
+		text = "Performances excellentes et stables."
+	elseif low < avg * 0.6 then
+		text = "Micro-saccades détectées (le 1% bas est très inférieur à la moyenne). Cherchez des pics : scripts lourds, chargement de modèles, particules."
+	elseif avg < 30 then
+		text = "FPS bas. Utilisez l'onglet Top pour trouver les modèles les plus lourds, puis testez leur impact."
+	else
+		text = "Performances correctes. Optimisez les modèles « MOYEN » pour gagner en marge."
+	end
+	adviceLabel.Text = text
+end
+
+-- ===================== PAGE PROFIL : UI =====================
+local pageLive = pages.live
+local LV = {}
+local sessionStart = os.clock()
+local spikes, spikeCount = {}, 0
+local recording, recData, recStart = false, {}, 0
+local lowFpsTicks = 0
+
+local function fmtTime(s)
+	local t = math.floor(s)
+	return string.format("%d:%02d", t // 60, t % 60)
+end
+
+local function liveBtn(parent, order, w, text)
+	local b = make("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.fromOffset(w, 40),
+		BackgroundColor3 = C.Row,
+		AutoButtonColor = false,
+		Font = FONT_SEMI,
+		TextSize = 12,
+		TextColor3 = C.Text,
+		Text = text,
+		Parent = parent,
+	}, { corner(9), stroke(C.Line, 0.5, 1) })
+	hoverFx(b, rowBase, rowHover)
+	return b
+end
+
+local liveCtrl = make("Frame", {
+	LayoutOrder = 1,
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundTransparency = 1,
+	Parent = pageLive,
+}, { make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
+LV.rec = liveBtn(liveCtrl, 1, 180, "Enregistrer  (F8)")
+LV.clear = liveBtn(liveCtrl, 2, 140, "Vider les pics")
+
+local function textCard(order)
+	local card = make("Frame", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = C.Row,
+		Parent = pageLive,
+	}, { corner(10), stroke(C.Line, 0.4, 1) })
+	local l = lbl({
+		Size = UDim2.new(1, -28, 0, 0),
+		Position = UDim2.fromOffset(14, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		RichText = true,
+		TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextSize = 12,
+		LineHeight = 1.35,
+		Text = "",
+		Parent = card,
+	})
+	make("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12), Parent = l })
+	return l
+end
+
+LV.recLabel = textCard(2)
+LV.recLabel.Text = "Aucun enregistrement. Lancez-en un, jouez quelques secondes, puis arrêtez pour obtenir un rapport (moyenne, 1% bas, p95/p99, pics)."
+
+local liveGrid = newGrid(pageLive, 3, 3, 2, 58)
+LV.hb = tileCell(liveGrid, 1, "Heartbeat")
+LV.phys = tileCell(liveGrid, 2, "Physique")
+LV.spk = tileCell(liveGrid, 3, "Pics > 50 ms")
+LV.send = tileCell(liveGrid, 4, "Réseau envoi")
+LV.recv = tileCell(liveGrid, 5, "Réseau réception")
+LV.time = tileCell(liveGrid, 6, "Durée de session")
+
+local memCard = make("Frame", {
+	LayoutOrder = 4,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundColor3 = C.Row,
+	Parent = pageLive,
+}, {
+	corner(10),
+	stroke(C.Line, 0.4, 1),
+	make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+	make("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12), PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }),
+})
+lbl({
+	LayoutOrder = 0,
+	Size = UDim2.new(1, 0, 0, 14),
+	Font = FONT_BOLD,
+	TextSize = 11,
+	TextColor3 = C.Muted,
+	Text = "MÉMOIRE PAR CATÉGORIE",
+	Parent = memCard,
+})
+LV.memRows = {}
+for i = 1, 6 do
+	local row = make("Frame", { LayoutOrder = i, Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, Parent = memCard })
+	local name = lbl({ Size = UDim2.new(0.65, 0, 0, 14), TextSize = 11, Parent = row })
+	local val = lbl({
+		Size = UDim2.new(0.35, 0, 0, 14),
+		Position = UDim2.fromScale(0.65, 0),
+		TextSize = 11,
+		TextColor3 = C.Muted,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	})
+	local track = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 3),
+		Position = UDim2.fromOffset(0, 20),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 0.9,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, { corner(2) })
+	local fill = make("Frame", { Size = UDim2.fromScale(0, 1), BorderSizePixel = 0, Parent = track }, { corner(2) })
+	bindAccent(function() fill.BackgroundColor3 = C.Accent end)
+	LV.memRows[i] = { row = row, name = name, val = val, fill = fill }
+end
+
+LV.spikeLabel = textCard(5)
+
+local MEM_TAGS = Enum.DeveloperMemoryTag:GetEnumItems()
+
+local function updateLive()
+	local ok, v = pcall(function() return StatsService.HeartbeatTimeMs end)
+	LV.hb.Text = if ok and v then string.format("%.1f ms", v) else "n/a"
+	ok, v = pcall(function() return StatsService.PhysicsStepTimeMs end)
+	LV.phys.Text = if ok and v then string.format("%.1f ms", v) else "n/a"
+	ok, v = pcall(function() return StatsService.DataSendKbps end)
+	LV.send.Text = if ok and v then string.format("%.1f KB/s", v) else "n/a"
+	ok, v = pcall(function() return StatsService.DataReceiveKbps end)
+	LV.recv.Text = if ok and v then string.format("%.1f KB/s", v) else "n/a"
+	LV.spk.Text = tostring(spikeCount)
+	LV.spk.TextColor3 = if spikeCount > 10 then C.Bad elseif spikeCount > 3 then C.Warn else C.Text
+	LV.time.Text = fmtTime(os.clock() - sessionStart)
+
+	local list = {}
+	for _, tag in ipairs(MEM_TAGS) do
+		local okT, mb = pcall(function() return StatsService:GetMemoryUsageMbForTag(tag) end)
+		if okT and mb and mb > 0.05 then table.insert(list, { name = tag.Name, mb = mb }) end
+	end
+	table.sort(list, function(a, b) return a.mb > b.mb end)
+	for i, r in ipairs(LV.memRows) do
+		local e = list[i]
+		r.row.Visible = e ~= nil
+		if e then
+			r.name.Text = e.name
+			r.val.Text = string.format("%.1f MB", e.mb)
+			r.fill.Size = UDim2.fromScale(math.clamp(e.mb / list[1].mb, 0.02, 1), 1)
+		end
+	end
+
+	local lines = { '<font color="#' .. C.Muted:ToHex() .. '"><b>DERNIERS PICS DE FRAME (> 50 ms)</b></font>' }
+	for i = #spikes, math.max(1, #spikes - 7), -1 do
+		local sp = spikes[i]
+		table.insert(lines, string.format('<b>%s</b>    <font color="#%s">%.0f ms</font>', fmtTime(sp.t),
+			(if sp.ms > 100 then C.Bad else C.Warn):ToHex(), sp.ms))
+	end
+	if #spikes == 0 then table.insert(lines, "Aucun pic détecté depuis le début de la session.") end
+	LV.spikeLabel.Text = table.concat(lines, "\n")
+end
+
+local function stopRecording()
+	recording = false
+	LV.rec.Text = "Enregistrer  (F8)"
+	LV.rec.TextColor3 = C.Text
+	local n = #recData
+	if n < 30 then
+		LV.recLabel.Text = "Enregistrement trop court pour produire un rapport."
+		return
+	end
+	local sum, o33, o50 = 0, 0, 0
+	for _, d in ipairs(recData) do
+		sum += d
+		if d > 0.0333 then o33 += 1 end
+		if d > 0.05 then o50 += 1 end
+	end
+	local sorted = table.clone(recData)
+	table.sort(sorted)
+	local function pct(p) return sorted[math.clamp(math.ceil(n * p), 1, n)] * 1000 end
+	local take = math.max(1, math.ceil(n * 0.01))
+	local worstSum = 0
+	for i = n - take + 1, n do worstSum += sorted[i] end
+	local avgFps, low1 = n / sum, take / worstSum
+	local grade, gcol
+	if low1 >= 50 and o50 == 0 then
+		grade, gcol = "FLUIDE", C.Good
+	elseif low1 >= 30 then
+		grade, gcol = "CORRECT", C.Warn
+	else
+		grade, gcol = "SACCADÉ", C.Bad
+	end
+	LV.recLabel.Text = string.format(
+		'<font color="#%s"><b>Rapport : %s</b></font>   (%s · %d frames)\nFPS moyen <b>%.0f</b>   ·   1%% bas <b>%.0f</b>\nTemps de frame : p50 %.1f ms · p95 %.1f ms · p99 %.1f ms · pire %.1f ms\nFrames > 33 ms : %d (%.1f%%)   ·   > 50 ms : %d',
+		gcol:ToHex(), grade, fmtTime(sum), n, avgFps, low1, pct(0.5), pct(0.95), pct(0.99), sorted[n] * 1000, o33, o33 / n * 100, o50)
+end
+
+local function toggleRecord()
+	if recording then
+		stopRecording()
+		toast("Enregistrement terminé", C.Good)
+	else
+		recData = {}
+		recStart = os.clock()
+		recording = true
+		LV.rec.Text = "Arrêter  (F8)"
+		LV.rec.TextColor3 = C.Bad
+		LV.recLabel.Text = "<b>Enregistrement en cours…</b>"
+		toast("Enregistrement démarré (F8 pour arrêter)", C.Accent)
+	end
+end
+LV.rec.MouseButton1Click:Connect(toggleRecord)
+LV.clear.MouseButton1Click:Connect(function()
+	spikes, spikeCount = {}, 0
+	updateLive()
+end)
+
+-- ===================== HIGHLIGHTS / MARQUEURS =====================
+local hoverHL = make("Highlight", {
+	Name = "Hover",
+	FillTransparency = 0.8,
+	OutlineTransparency = 0,
+	DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+	Enabled = false,
+	Parent = hlFolder,
+})
+bindAccent(function()
+	hoverHL.FillColor = C.Accent
+	hoverHL.OutlineColor = C.Accent
+end)
+local selHL = make("Highlight", {
+	Name = "Selected",
+	FillTransparency = 1,
+	OutlineColor = Color3.fromRGB(255, 255, 255),
+	OutlineTransparency = 0.25,
+	DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+	Enabled = false,
+	Parent = hlFolder,
+})
+
+local function clearMarkers()
+	markersFolder:ClearAllChildren()
+	if activeRow and activeRow.Parent then
+		activeRow.BackgroundColor3 = C.Row
+	end
+	activeRow = nil
+end
+
+local function showMarkers(list, color)
+	for i, part in ipairs(list) do
+		if i > MAX_MARKERS then break end
+		if part and part.Parent then
+			make("BoxHandleAdornment", {
+				Adornee = part,
+				Size = part.Size + Vector3.new(0.06, 0.06, 0.06),
+				Color3 = color,
+				Transparency = 0.55,
+				AlwaysOnTop = true,
+				ZIndex = 1,
+				Parent = markersFolder,
+			})
+		end
+	end
+end
+
+local function updateSelectionHL()
+	local t = selected
+	if S.selHL and t and t ~= Workspace and t.Parent and t:IsA("PVInstance") then
+		selHL.Adornee = t
+		selHL.Enabled = true
+	else
+		selHL.Adornee = nil
+		selHL.Enabled = false
+	end
+end
+
+-- ===================== MASQUAGE LOCAL (test d'impact) =====================
+local function isFx(d)
+	return d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") or d:IsA("Light")
+		or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles")
+end
+
+local function applyHidden(target)
+	if hiddenState or not target or target == Workspace then return end
+	local st = { parts = {}, fx = {} }
+	for _, d in ipairs(target:GetDescendants()) do
+		if d:IsA("BasePart") then
+			st.parts[d] = d.LocalTransparencyModifier
+			d.LocalTransparencyModifier = 1
+		elseif isFx(d) then
+			st.fx[d] = d.Enabled
+			d.Enabled = false
+		end
+	end
+	hiddenState = { target = target, st = st }
+end
+
+local function restoreHidden()
+	if not hiddenState then return end
+	local st = hiddenState.st
+	for p, v in pairs(st.parts) do
+		if p.Parent then p.LocalTransparencyModifier = v end
+	end
+	for f, v in pairs(st.fx) do
+		if f.Parent then f.Enabled = v end
+	end
+	hiddenState = nil
+end
+
+updateActions = function()
+	local has = selected ~= nil and selected ~= Workspace
+	B.test.TextColor3 = if has then C.Text else C.Muted
+	B.hide.TextColor3 = if selected then C.Text else C.Muted
+	B.hide.Text = if hiddenState then "Afficher" else "Masquer"
+	B.report.TextColor3 = if lastScan then C.Text else C.Muted
+	B.redo.TextColor3 = if selected then C.Text else C.Muted
+	B.fixall.TextColor3 = if lastScan then C.Text else C.Muted
+	B.undo.TextColor3 = if #undoStack > 0 then C.Text else C.Muted
+end
+
+-- ===================== SCAN / EVALUATION =====================
+local function buildSkipSet()
+	local skip = {}
+	if S.ignorePlayers then
+		for _, p in ipairs(Players:GetPlayers()) do
+			local ch = p.Character
+			if ch then
+				skip[ch] = true
+				for _, d in ipairs(ch:GetDescendants()) do skip[d] = true end
+			end
+		end
+	end
+	skip[Workspace.Terrain] = true
+	return skip
+end
+
+local KIND_CACHE = {}
+local function kindOf(d)
+	local cn = d.ClassName
+	local k = KIND_CACHE[cn]
+	if k == nil then
+		if d:IsA("BasePart") then k = "part"
+		elseif d:IsA("Light") then k = "light"
+		elseif d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") or d:IsA("Fire")
+			or d:IsA("Smoke") or d:IsA("Sparkles") then k = "fx"
+		elseif d:IsA("BaseScript") then k = "script"
+		elseif d:IsA("Decal") or d:IsA("Texture") then k = "decal"
+		elseif d:IsA("SurfaceGui") then k = "gui"
+		elseif d:IsA("Constraint") or d:IsA("JointInstance") or d:IsA("WeldConstraint") then k = "joint"
+		else k = false end
+		KIND_CACHE[cn] = k
+	end
+	return k
+end
+
+local function scan(target, cancel, progress, yieldEvery, skip)
+	local n = {
+		parts = 0, meshes = 0, unions = 0, uniq = 0, precise = 0, rprecise = 0, shadows = 0,
+		transp = 0, unanch = 0, touch = 0, lights = 0, lightSh = 0, fx = 0, scripts = 0,
+		decals = 0, guis = 0, joints = 0,
+	}
+	local L = { unions = {}, precise = {}, rprecise = {}, shadows = {}, transp = {}, unanch = {}, touch = {}, lightSh = {}, fx = {} }
+	skip = skip or buildSkipSet()
+	local meshIds = {}
+	local t0 = os.clock()
+	local descendants = target:GetDescendants()
+	local total = #descendants
+
+	for i, d in ipairs(descendants) do
+		if yieldEvery and i % yieldEvery == 0 then
+			if progress then progress(i / total) end
+			task.wait()
+			if cancel and cancel() then return nil end
+		end
+		local kind = kindOf(d)
+		if not kind or skip[d] then continue end
+
+		if kind == "part" then
+			n.parts += 1
+			if d.CastShadow then
+				n.shadows += 1
+				table.insert(L.shadows, d)
+			end
+			if (d.Transparency > 0 and d.Transparency < 1) or d.Material == Enum.Material.Glass then
+				n.transp += 1
+				table.insert(L.transp, d)
+			end
+			if not d.Anchored then
+				n.unanch += 1
+				table.insert(L.unanch, d)
+			elseif not d.CanCollide and d.CanTouch and d.CanQuery then
+				n.touch += 1
+				table.insert(L.touch, d)
+			end
+			if d:IsA("MeshPart") then
+				n.meshes += 1
+				if d.MeshId ~= "" then meshIds[d.MeshId] = true end
+				if d.CanCollide and d.CollisionFidelity == Enum.CollisionFidelity.PreciseConvexDecomposition then
+					n.precise += 1
+					table.insert(L.precise, d)
+				end
+				if d.RenderFidelity == Enum.RenderFidelity.Precise then
+					n.rprecise += 1
+					table.insert(L.rprecise, d)
+				end
+			elseif d:IsA("UnionOperation") then
+				n.unions += 1
+				table.insert(L.unions, d)
+				if d.CanCollide and d.CollisionFidelity == Enum.CollisionFidelity.PreciseConvexDecomposition then
+					n.precise += 1
+					table.insert(L.precise, d)
+				end
+			end
+		elseif kind == "light" then
+			if d.Enabled then
+				n.lights += 1
+				if d.Shadows then
+					n.lightSh += 1
+					local p = d.Parent
+					if p and p:IsA("Attachment") then p = p.Parent end
+					if p and p:IsA("BasePart") then table.insert(L.lightSh, p) end
+				end
+			end
+		elseif kind == "fx" then
+			if d.Enabled then
+				n.fx += 1
+				local p = d.Parent
+				if p and p:IsA("Attachment") then p = p.Parent end
+				if p and p:IsA("BasePart") then table.insert(L.fx, p) end
+			end
+		elseif kind == "script" then
+			if d.Enabled then n.scripts += 1 end
+		elseif kind == "decal" then
+			n.decals += 1
+		elseif kind == "gui" then
+			n.guis += 1
+		elseif kind == "joint" then
+			n.joints += 1
+		end
+	end
+	for _ in pairs(meshIds) do n.uniq += 1 end
+	return { n = n, L = L, total = total, time = os.clock() - t0 }
+end
+
+local function evaluate(n, L, k)
+	local score = 100
+	local issues = {}
+	local function flag(bad, penalty, text, tip, list)
+		score -= penalty
+		table.insert(issues, { text = text, tip = tip, color = if bad then C.Bad else C.Warn, list = list or {}, bad = bad })
+	end
+
+	if n.parts > 500 * k then
+		flag(true, 30, string.format("Trop de pièces (%d)", n.parts), "Fusionnez les détails en MeshParts, supprimez les pièces invisibles.")
+	elseif n.parts > 250 * k then
+		flag(false, 15, string.format("Nombre de pièces élevé (%d)", n.parts), "Visez moins de 250 pièces par modèle.")
+	elseif n.parts > 120 * k then
+		score -= 5
+	end
+
+	if n.unions > 15 * k then
+		flag(true, 20, string.format("%d Unions CSG", n.unions), "Convertissez-les en MeshPart (export/import Blender).", L.unions)
+	elseif n.unions > 5 * k then
+		flag(false, 10, string.format("%d Unions CSG détectées", n.unions), "Les unions sont plus lourdes que des meshs.", L.unions)
+	elseif n.unions > 0 then
+		score -= 3
+	end
+
+	if n.precise > 20 * k then
+		flag(true, 20, string.format("%d collisions « Precise »", n.precise), "Passez CollisionFidelity en Hull, Box ou Default.", L.precise)
+	elseif n.precise > 5 * k then
+		flag(false, 10, string.format("%d collisions « Precise » coûteuses", n.precise), "Utilisez Hull ou Box quand c'est possible.", L.precise)
+	elseif n.precise > 0 then
+		score -= 4
+	end
+
+	if n.shadows > 250 * k then
+		flag(true, 15, string.format("%d pièces avec CastShadow", n.shadows), "Désactivez CastShadow sur les petits détails.", L.shadows)
+	elseif n.shadows > 100 * k then
+		flag(false, 7, string.format("%d pièces projettent des ombres", n.shadows), "Désactivez CastShadow sur les détails.", L.shadows)
+	end
+
+	if n.unanch > 200 * k then
+		flag(true, 12, string.format("%d pièces non ancrées", n.unanch), "Ancrez (Anchored) tout ce qui est statique : coût physique.", L.unanch)
+	elseif n.unanch > 60 * k then
+		flag(false, 6, string.format("%d pièces non ancrées", n.unanch), "Ancrez les pièces qui ne bougent pas.", L.unanch)
+	end
+
+	if n.touch > 150 * k then
+		flag(false, 5, string.format("%d pièces décoratives avec Touch/Query", n.touch), "Désactivez CanTouch et CanQuery sur ces pièces.", L.touch)
+	end
+
+	if n.transp > 40 * k then
+		flag(false, 10, string.format("%d pièces transparentes / Glass", n.transp), "La transparence coûte cher en rendu.", L.transp)
+	elseif n.transp > 15 * k then
+		score -= 4
+	end
+
+	if n.lightSh > 4 * k then
+		flag(true, 15, string.format("%d lumières avec Shadows", n.lightSh), "Une seule lumière à ombres suffit souvent.", L.lightSh)
+	elseif n.lightSh > 1 * k then
+		flag(false, 7, string.format("%d lumières projettent des ombres", n.lightSh), "Désactivez Shadows sur les lumières secondaires.", L.lightSh)
+	end
+
+	if n.fx > 10 * k then
+		flag(false, 10, string.format("%d effets actifs (particules, beams…)", n.fx), "Réduisez le Rate ou désactivez hors de vue.", L.fx)
+	elseif n.fx > 4 * k then
+		score -= 4
+	end
+
+	if n.rprecise > 25 * k then
+		flag(false, 6, string.format("%d MeshParts en RenderFidelity Precise", n.rprecise), "Utilisez Automatic ou Performance.", L.rprecise)
+	end
+
+	if n.uniq > 80 * k then
+		flag(false, 5, string.format("%d MeshIds différents", n.uniq), "Réutilisez les mêmes meshs pour réduire les draw calls.")
+	end
+
+	if n.guis > 10 * k then
+		flag(false, 5, string.format("%d SurfaceGuis", n.guis), "Chaque SurfaceGui a un coût de rendu : limitez-les.")
+	end
+
+	if n.joints > 60 * k then
+		flag(false, 4, string.format("%d joints / contraintes", n.joints), "Réduisez les welds et contraintes inutiles.")
+	end
+
+	if n.scripts > 8 * k then
+		flag(false, 8, string.format("%d scripts actifs", n.scripts), "Regroupez la logique dans moins de scripts.")
+	end
+
+	if n.decals > 150 * k then
+		flag(false, 4, string.format("%d Decals/Textures", n.decals), "Fusionnez les textures dans un atlas.")
+	end
+
+	local sorted = {}
+	for _, it in ipairs(issues) do if it.bad then table.insert(sorted, it) end end
+	for _, it in ipairs(issues) do if not it.bad then table.insert(sorted, it) end end
+	return math.clamp(score, 0, 100), sorted
+end
+
+local function currentK(isWorld)
+	return SEV[S.severity] * (if isWorld then 12 else 1)
+end
+
+-- ===================== CORRECTIFS LOCAUX =====================
+-- Les correctifs ne modifient que votre client (annulables avec « Annuler »).
+-- Reportez ensuite les changements dans Studio.
+local function setProp(rec, inst, prop, val)
+	if inst[prop] ~= val then
+		table.insert(rec, { inst, prop, inst[prop] })
+		inst[prop] = val
+	end
+end
+
+local FIXES = {
+	shadows = function(p, rec) setProp(rec, p, "CastShadow", false) end,
+	touch = function(p, rec)
+		setProp(rec, p, "CanTouch", false)
+		setProp(rec, p, "CanQuery", false)
+	end,
+	precise = function(p, rec) setProp(rec, p, "CollisionFidelity", Enum.CollisionFidelity.Hull) end,
+	rprecise = function(p, rec) setProp(rec, p, "RenderFidelity", Enum.RenderFidelity.Automatic) end,
+	lightSh = function(p, rec)
+		for _, d in ipairs(p:GetDescendants()) do
+			if d:IsA("Light") then setProp(rec, d, "Shadows", false) end
+		end
+	end,
+	fx = function(p, rec)
+		for _, d in ipairs(p:GetDescendants()) do
+			if d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") or d:IsA("Fire")
+				or d:IsA("Smoke") or d:IsA("Sparkles") then
+				setProp(rec, d, "Enabled", false)
+			end
+		end
+	end,
+}
+
+local function applyFix(key, list)
+	local fn = FIXES[key]
+	if not fn then return 0 end
+	local rec = {}
+	for _, p in ipairs(list) do
+		if p.Parent then fn(p, rec) end
+	end
+	if #rec > 0 then table.insert(undoStack, rec) end
+	return #rec
+end
+
+local function reanalyzeAfterFix(prev, changed)
+	if not selected then return end
+	local target = selected
+	task.spawn(function()
+		analyze(target)
+		if lastScan then
+			toast(string.format("%d modifications · score %d → %d", changed, prev, lastScan.score),
+				if lastScan.score >= prev then C.Good else C.Warn)
+		end
+	end)
+end
+
+B.fixall.MouseButton1Click:Connect(function()
+	if testing then return end
+	if not lastScan then
+		toast("Analysez d'abord un modèle.", C.Warn)
+		return
+	end
+	local prev, changed = lastScan.score, 0
+	for _, it in ipairs(lastScan.issues) do
+		if it.key and FIXES[it.key] then changed += applyFix(it.key, it.list) end
+	end
+	if changed == 0 then
+		toast("Rien à corriger automatiquement.", C.Warn)
+		return
+	end
+	reanalyzeAfterFix(prev, changed)
+end)
+
+B.undo.MouseButton1Click:Connect(function()
+	if testing then return end
+	local rec = table.remove(undoStack)
+	if not rec then
+		toast("Aucun correctif à annuler.", C.Warn)
+		return
+	end
+	for i = #rec, 1, -1 do
+		local inst, prop, old = rec[i][1], rec[i][2], rec[i][3]
+		if inst.Parent then inst[prop] = old end
+	end
+	updateActions()
+	toast(string.format("%d modifications annulées", #rec), C.Good)
+	if selected then
+		local target = selected
+		task.spawn(analyze, target)
+	end
+end)
+
+-- ===================== ISSUES UI =====================
+local function clearIssues()
+	clearMarkers()
+	for _, ch in ipairs(U.issuesList:GetChildren()) do
+		if not ch:IsA("UIListLayout") then ch:Destroy() end
+	end
+end
+
+local function addInfoRow(text, color, order)
+	local l = lbl({
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = ROW_T,
+		BackgroundColor3 = C.Row,
+		TextWrapped = true,
+		TextColor3 = color,
+		TextSize = 12,
+		Text = text,
+		Parent = U.issuesList,
+	})
+	make("UICorner", { CornerRadius = UDim.new(0, 9), Parent = l })
+	make("UIPadding", {
+		PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12),
+		PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14),
+		Parent = l,
+	})
+end
+
+local function addIssueRow(order, item)
+	local row = make("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = C.Row,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = U.issuesList,
+	}, { corner(9), stroke(C.Line, 0.5, 1), make("UISizeConstraint", { MinSize = Vector2.new(0, 62) }) })
+	make("Frame", {
+		Size = UDim2.new(0, 3, 1, -18),
+		Position = UDim2.fromOffset(8, 9),
+		BackgroundColor3 = item.color,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, { corner(2) })
+	local text = lbl({
+		Size = UDim2.new(1, -112, 0, 0),
+		Position = UDim2.fromOffset(22, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		RichText = true,
+		TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextSize = 12,
+		Text = string.format(
+			'<font color="#%s"><b>%s</b></font>\n<font color="#%s" size="11">%s</font>',
+			item.color:ToHex(), item.text, C.Muted:ToHex(), item.tip
+		),
+		Parent = row,
+	})
+	make("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 14), Parent = text })
+
+	if #item.list > 0 then
+		lbl({
+			Size = UDim2.fromOffset(70, 12),
+			Position = UDim2.new(1, -12, 0, 10),
+			AnchorPoint = Vector2.new(1, 0),
+			TextSize = 11,
+			Font = FONT_SEMI,
+			TextColor3 = C.Accent,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			Text = "Voir " .. (if #item.list > MAX_MARKERS then MAX_MARKERS .. "+" else tostring(#item.list)),
+			Parent = row,
+		})
+		if item.key and FIXES[item.key] then
+			local fb = make("TextButton", {
+				Size = UDim2.fromOffset(66, 22),
+				Position = UDim2.new(1, -12, 1, -10),
+				AnchorPoint = Vector2.new(1, 1),
+				BackgroundColor3 = C.AccentBg,
+				AutoButtonColor = false,
+				Font = FONT_SEMI,
+				TextSize = 11,
+				TextColor3 = C.Accent,
+				Text = "Corriger",
+				Parent = row,
+			}, { corner(6) })
+			fb.MouseButton1Click:Connect(function()
+				if testing then return end
+				local prev = if lastScan then lastScan.score else 0
+				local changed = applyFix(item.key, item.list)
+				if changed == 0 then
+					toast("Rien à modifier.", C.Warn)
+					return
+				end
+				reanalyzeAfterFix(prev, changed)
+			end)
+		end
+		row.MouseEnter:Connect(function()
+			if activeRow ~= row then row.BackgroundColor3 = C.RowHover end
+		end)
+		row.MouseLeave:Connect(function()
+			if activeRow ~= row then row.BackgroundColor3 = C.Row end
+		end)
+		row.MouseButton1Click:Connect(function()
+			if activeRow == row then
+				clearMarkers()
+				return
+			end
+			clearMarkers()
+			activeRow = row
+			row.BackgroundColor3 = C.RowHover
+			showMarkers(item.list, item.color)
+		end)
+	end
+end
+
+-- ===================== ANALYSE =====================
+local function renderAnalysis(target, data)
+	local n, L = data.n, data.L
+	local isWorld = target == Workspace
+	local k = currentK(isWorld)
+	local score, issues = evaluate(n, L, k)
+	for _, it in ipairs(issues) do
+		for key, l in pairs(L) do
+			if l == it.list then it.key = key end
+		end
+	end
+	local col = scoreColor(score)
+
+	V.parts.Text = tostring(n.parts)
+	V.parts.TextColor3 = colorFor(n.parts, 250 * k, 500 * k)
+	V.meshes.Text = tostring(n.meshes)
+	V.unions.Text = tostring(n.unions)
+	V.unions.TextColor3 = colorFor(n.unions, 5 * k, 15 * k)
+	V.uniq.Text = tostring(n.uniq)
+	V.uniq.TextColor3 = colorFor(n.uniq, 80 * k, 160 * k)
+	V.shadows.Text = tostring(n.shadows)
+	V.shadows.TextColor3 = colorFor(n.shadows, 100 * k, 250 * k)
+	V.precise.Text = tostring(n.precise)
+	V.precise.TextColor3 = colorFor(n.precise, 5 * k, 20 * k)
+	V.unanch.Text = tostring(n.unanch)
+	V.unanch.TextColor3 = colorFor(n.unanch, 60 * k, 200 * k)
+	V.touch.Text = tostring(n.touch)
+	V.touch.TextColor3 = colorFor(n.touch, 150 * k, 400 * k)
+	V.transp.Text = tostring(n.transp)
+	V.transp.TextColor3 = colorFor(n.transp, 15 * k, 40 * k)
+	V.lights.Text = string.format("%d (%d)", n.lights, n.lightSh)
+	V.lights.TextColor3 = colorFor(n.lightSh, 1 * k, 4 * k)
+	V.fx.Text = tostring(n.fx)
+	V.fx.TextColor3 = colorFor(n.fx, 4 * k, 10 * k)
+	V.scripts.Text = tostring(n.scripts)
+	V.guis.Text = tostring(n.guis)
+	V.guis.TextColor3 = colorFor(n.guis, 10 * k, 30 * k)
+	V.joints.Text = tostring(n.joints)
+	V.joints.TextColor3 = colorFor(n.joints, 60 * k, 150 * k)
+	V.decals.Text = tostring(n.decals)
+	V.decals.TextColor3 = colorFor(n.decals, 150 * k, 400 * k)
+
+	U.score.Text = tostring(score)
+	U.score.TextColor3 = col
+	U.verdict.Text = scoreVerdict(score)
+	U.verdict.TextColor3 = col
+	tw(U.scoreFill, { Size = UDim2.fromScale(score / 100, 1), BackgroundColor3 = col })
+	U.info.Text = string.format("%d éléments · %.2fs%s%s", data.total, data.time,
+		if isWorld then " · seuils ×12" else "", if S.severity ~= 2 then " · " .. SEV_NAMES[S.severity] else "")
+
+	clearIssues()
+	if #issues == 0 then
+		addInfoRow("Modèle bien optimisé. Aucun problème majeur détecté.", C.Good, 1)
+	else
+		for i, item in ipairs(issues) do addIssueRow(i, item) end
+	end
+
+	lastScan = {
+		name = target.Name,
+		path = if isWorld then "Workspace" else target:GetFullName(),
+		score = score,
+		verdict = scoreVerdict(score),
+		n = n,
+		issues = issues,
+	}
+	updateActions()
+end
+
+analyze = function(target)
+	analysisToken += 1
+	local token = analysisToken
+	if hiddenState and hiddenState.target ~= target and not testing then restoreHidden() end
+	selected = target
+	updateSelectionHL()
+
+	local isWorld = target == Workspace
+	U.name.Text = target.Name
+	U.path.Text = if isWorld then "Workspace (scan global)" else target:GetFullName()
+	U.info.Text = "Analyse en cours…"
+	U.score.Text = "…"
+	U.score.TextColor3 = C.Muted
+	U.verdict.Text = "ANALYSE"
+	U.verdict.TextColor3 = C.Muted
+	tw(U.scoreFill, { Size = UDim2.fromScale(0, 1), BackgroundColor3 = C.Muted })
+	X.impactCard.Visible = false
+	clearIssues()
+	addInfoRow("Analyse en cours…", C.Muted, 1)
+	X.progFill.Size = UDim2.fromScale(0, 1)
+	X.progTrack.Visible = true
+	updateActions()
+
+	local data = scan(target, function() return token ~= analysisToken end, function(p)
+		X.progFill.Size = UDim2.fromScale(p, 1)
+	end, 300)
+	if not data or token ~= analysisToken then return end
+	X.progTrack.Visible = false
+	renderAnalysis(target, data)
+end
+
+-- ===================== CIBLAGE 3D =====================
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function modelChain(start)
+	local chain = {}
+	local cur = start
+	while cur and cur ~= Workspace do
+		if cur:IsA("Model") then table.insert(chain, cur) end
+		cur = cur.Parent
+	end
+	return chain
+end
+
+local function baseFilter()
+	local filter = {}
+	if S.ignorePlayers then
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p.Character then table.insert(filter, p.Character) end
+		end
+	elseif localPlayer.Character then
+		table.insert(filter, localPlayer.Character)
+	end
+	return filter
+end
+
+local function chainAt(abs)
+	local cam = Workspace.CurrentCamera
+	if not cam then return nil end
+	local ray = cam:ViewportPointToRay(abs.X, abs.Y)
+	local filter = baseFilter()
+	rayParams.FilterDescendantsInstances = filter
+	for _ = 1, 6 do
+		local res = Workspace:Raycast(ray.Origin, ray.Direction * 2000, rayParams)
+		if not res or not res.Instance then return nil end
+		local inst = res.Instance
+		if inst:IsA("Terrain") then return nil end
+		if inst.Transparency >= 1 then
+			table.insert(filter, inst)
+			rayParams.FilterDescendantsInstances = filter
+		else
+			local chain = modelChain(inst.Parent)
+			if #chain == 0 then return nil end
+			return chain
+		end
+	end
+	return nil
+end
+
+local function pointerOverUi(abs)
+	local function inside(f)
+		local p, s = f.AbsolutePosition, f.AbsoluteSize
+		return abs.X >= p.X and abs.X <= p.X + s.X and abs.Y >= p.Y and abs.Y <= p.Y + s.Y
+	end
+	if inside(fpsBar) then return true end
+	return panel.Visible and inside(panel)
+end
+
+updateNavButtons = function()
+	local can = (selChain ~= nil and not isPicking) or (isPicking and hoverChain ~= nil)
+	B.up.TextColor3 = if can then C.Text else C.Muted
+	B.down.TextColor3 = if can then C.Text else C.Muted
+end
+
+local function applyHover()
+	if hoverChain and hoverChain[hoverIdx] then
+		hoveredModel = hoverChain[hoverIdx]
+		hoverHL.Adornee = hoveredModel
+		hoverHL.Enabled = S.hoverHL
+		X.banner.Text = string.format("Cible : %s  (niveau %d/%d)  ·  [Q] parent  [E] enfant", hoveredModel.Name, hoverIdx, #hoverChain)
+	else
+		hoveredModel = nil
+		hoverHL.Adornee = nil
+		hoverHL.Enabled = false
+		X.banner.Text = "Survolez un modèle dans le monde et cliquez / touchez."
+	end
+	X.banner.TextColor3 = C.Accent
+	updateNavButtons()
+end
+
+refreshPick = function()
+	B.pick.BackgroundColor3 = if isPicking then C.Accent else C.Row
+	B.pick.TextColor3 = if isPicking then C.Bg else C.Text
+	B.pick.Text = if isPicking then "Ciblage…" else "Cibler"
+end
+bindAccent(refreshPick)
+
+setPicking = function(active)
+	isPicking = active
+	refreshPick()
+	if active then
+		hoverChain, hoverIdx = nil, 1
+		applyHover()
+	else
+		hoverHL.Enabled = false
+		hoverHL.Adornee = nil
+		hoveredModel, hoverChain = nil, nil
+		if selected then
+			X.banner.Text = "Analyse terminée. Parent/Enfant change le niveau, Cibler pour re-cibler."
+		else
+			X.banner.Text = "Cliquez sur « Cibler » puis sur un modèle du monde."
+		end
+		X.banner.TextColor3 = C.Muted
+		updateNavButtons()
+	end
+end
+
+local function pickAt(abs)
+	if testing then return end
+	local chain = chainAt(abs)
+	if not chain then return end
+	local idx = 1
+	if hoveredModel then
+		local f = table.find(chain, hoveredModel)
+		if f then idx = f end
+	end
+	setPicking(false)
+	selChain, selIdx = chain, idx
+	analyze(chain[idx])
+	updateNavButtons()
+end
+
+local function stepLevel(dir)
+	if testing then return end
+	if isPicking then
+		if hoverChain then
+			hoverIdx = math.clamp(hoverIdx + dir, 1, #hoverChain)
+			applyHover()
+		end
+	elseif selChain then
+		local newIdx = math.clamp(selIdx + dir, 1, #selChain)
+		if newIdx ~= selIdx then
+			selIdx = newIdx
+			analyze(selChain[selIdx])
+		end
+	end
+end
+
+-- ===================== TEST D'IMPACT / RAPPORT =====================
+local function measureFps(seconds)
+	local t, frames = 0, 0
+	while t < seconds do
+		t += RunService.RenderStepped:Wait()
+		frames += 1
+	end
+	return frames / t
+end
+
+local function runImpactTest()
+	if testing then return end
+	local target = selected
+	if not target or target == Workspace or not target.Parent then
+		toast("Sélectionnez d'abord un modèle précis.", C.Warn)
+		return
+	end
+	restoreHidden()
+	updateActions()
+	testing = true
+	X.impactCard.Visible = true
+	X.impactLabel.Text = "<b>Mesure en cours…</b>\nGardez la caméra tournée vers le modèle (≈ 4 s)."
+	local fpsOn, fpsOff
+	local ok = pcall(function()
+		task.wait(0.3)
+		fpsOn = measureFps(1.5)
+		applyHidden(target)
+		task.wait(0.3)
+		fpsOff = measureFps(1.5)
+	end)
+	restoreHidden()
+	testing = false
+	updateActions()
+
+	if not ok or not fpsOn or not fpsOff then
+		X.impactLabel.Text = "Mesure impossible (modèle supprimé ?)."
+		return
+	end
+	local msOn, msOff = 1000 / fpsOn, 1000 / fpsOff
+	local cost = msOn - msOff
+	local text
+	if cost >= 1 then
+		text = string.format('<font color="#%s"><b>Coût de rendu ≈ %.1f ms / frame</b></font>\n%.0f FPS visible → %.0f FPS masqué (+%.0f FPS).',
+			C.Bad:ToHex(), cost, fpsOn, fpsOff, fpsOff - fpsOn)
+	elseif cost >= 0.3 then
+		text = string.format('<font color="#%s"><b>Coût de rendu ≈ %.1f ms / frame</b></font>\n%.0f FPS visible → %.0f FPS masqué.',
+			C.Warn:ToHex(), cost, fpsOn, fpsOff)
+	else
+		text = string.format('<font color="#%s"><b>Impact négligeable</b></font>\n%.0f FPS → %.0f FPS. Si vous attendiez plus : regardez le modèle de face, ou vos FPS sont plafonnés.',
+			C.Good:ToHex(), fpsOn, fpsOff)
+	end
+	X.impactLabel.Text = text
+	toast(string.format("Impact mesuré : %.1f ms / frame", math.max(cost, 0)), if cost >= 1 then C.Bad elseif cost >= 0.3 then C.Warn else C.Good)
+end
+
+local function buildReport()
+	if not lastScan then return "Aucune analyse disponible." end
+	local d, n = lastScan, lastScan.n
+	local lines = {
+		"=== RAPPORT D'OPTIMISATION ===",
+		"Modèle : " .. d.name,
+		"Chemin : " .. d.path,
+		string.format("Score  : %d/100 (%s)", d.score, d.verdict),
+		"",
+		string.format("Pièces: %d | MeshParts: %d (MeshIds uniques: %d) | Unions: %d", n.parts, n.meshes, n.uniq, n.unions),
+		string.format("CastShadow: %d | Col. précises: %d | Non-ancrées: %d | Touch/Query inutiles: %d", n.shadows, n.precise, n.unanch, n.touch),
+		string.format("Transparentes: %d | Lumières: %d (ombres: %d) | FX: %d", n.transp, n.lights, n.lightSh, n.fx),
+		string.format("Scripts: %d | SurfaceGuis: %d | Joints: %d | Decals: %d", n.scripts, n.guis, n.joints, n.decals),
+		"",
+		"Problèmes :",
+	}
+	if #d.issues == 0 then
+		table.insert(lines, "  Aucun problème majeur.")
+	else
+		for _, it in ipairs(d.issues) do
+			table.insert(lines, string.format("  - [%s] %s -> %s", if it.bad then "CRITIQUE" else "ATTENTION", it.text, it.tip))
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
+-- ===================== CLASSEMENT =====================
+local function renderRanking()
+	for _, ch in ipairs(R.list:GetChildren()) do
+		if not ch:IsA("UIListLayout") then ch:Destroy() end
+	end
+	local arr = {}
+	local q = string.lower(R.search.Text)
+	for _, e in ipairs(rankResults) do
+		if q == "" or string.find(string.lower(e.model:GetFullName()), q, 1, true) then
+			table.insert(arr, e)
+		end
+	end
+	if rankSort == "score" then
+		table.sort(arr, function(a, b)
+			if a.score ~= b.score then return a.score < b.score end
+			return a.parts > b.parts
+		end)
+	else
+		table.sort(arr, function(a, b) return a.parts > b.parts end)
+	end
+	for i = 1, math.min(25, #arr) do
+		local e = arr[i]
+		local row = make("TextButton", {
+			LayoutOrder = i,
+			Size = UDim2.new(1, 0, 0, 58),
+			BackgroundColor3 = C.Row,
+			AutoButtonColor = false,
+			Text = "",
+			Parent = R.list,
+		}, { corner(9), stroke(C.Line, 0.5, 1) })
+		hoverFx(row, rowBase, rowHover)
+		lbl({
+			Size = UDim2.fromOffset(30, 20),
+			Position = UDim2.new(0, 12, 0.5, 0),
+			AnchorPoint = Vector2.new(0, 0.5),
+			Font = FONT_BOLD,
+			TextSize = 12,
+			TextColor3 = C.Muted,
+			Text = "#" .. i,
+			Parent = row,
+		})
+		lbl({
+			Size = UDim2.new(1, -190, 0, 20),
+			Position = UDim2.fromOffset(46, 10),
+			Font = FONT_SEMI,
+			TextSize = 13,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = e.model.Name,
+			Parent = row,
+		})
+		lbl({
+			Size = UDim2.new(1, -190, 0, 16),
+			Position = UDim2.fromOffset(46, 32),
+			TextSize = 10,
+			TextColor3 = C.Muted,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = e.model:GetFullName(),
+			Parent = row,
+		})
+		lbl({
+			Size = UDim2.fromOffset(80, 16),
+			Position = UDim2.new(1, -76, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			TextSize = 11,
+			TextColor3 = C.Muted,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			Text = e.parts .. " pièces",
+			Parent = row,
+		})
+		local col = scoreColor(e.score)
+		local badge = make("Frame", {
+			Size = UDim2.fromOffset(48, 28),
+			Position = UDim2.new(1, -12, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			BackgroundColor3 = col,
+			BackgroundTransparency = 0.82,
+			Parent = row,
+		}, { corner(7) })
+		lbl({
+			Size = UDim2.fromScale(1, 1),
+			Font = FONT_BOLD,
+			TextSize = 14,
+			TextColor3 = col,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			Text = tostring(e.score),
+			Parent = badge,
+		})
+		row.MouseButton1Click:Connect(function()
+			if testing or not e.model.Parent then return end
+			setPicking(false)
+			selChain, selIdx = modelChain(e.model), 1
+			setTab("model")
+			analyze(e.model)
+			updateNavButtons()
+		end)
+	end
+end
+
+local function runRankScan()
+	if rankScanning then
+		rankToken += 1
+		return
+	end
+	rankScanning = true
+	rankToken += 1
+	local token = rankToken
+	rankResults = {}
+	renderRanking()
+	R.status.Text = "Recherche des modèles…"
+	R.status.TextColor3 = C.Muted
+	R.track.Visible = true
+	R.fill.Size = UDim2.fromScale(0, 1)
+	R.scan.Text = "Arrêter"
+
+	local t0 = os.clock()
+	local skip = buildSkipSet()
+	local candidates = {}
+	local all = Workspace:GetDescendants()
+	for i, m in ipairs(all) do
+		if i % 4000 == 0 then
+			task.wait()
+			if token ~= rankToken then break end
+		end
+		if m:IsA("Model") and not skip[m] and m:FindFirstChildWhichIsA("BasePart") then
+			table.insert(candidates, m)
+			if #candidates >= 800 then break end
+		end
+	end
+
+	local cost = 0
+	if token == rankToken then
+		for i, m in ipairs(candidates) do
+			if m.Parent then
+				local data = scan(m, nil, nil, nil, skip)
+				if data then
+					if data.n.parts >= 10 then
+						local score = evaluate(data.n, data.L, currentK(false))
+						table.insert(rankResults, { model = m, parts = data.n.parts, score = score })
+					end
+					cost += data.total
+				end
+			end
+			if cost > 6000 then
+				cost = 0
+				R.fill.Size = UDim2.fromScale(i / #candidates, 1)
+				R.status.Text = string.format("Analyse… %d / %d modèles", i, #candidates)
+				task.wait()
+				if token ~= rankToken then break end
+			end
+		end
+	end
+
+	R.track.Visible = false
+	R.scan.Text = "Scanner la map"
+	if token == rankToken then
+		renderRanking()
+		R.status.Text = string.format("%d modèles analysés en %.1fs · cliquez sur un modèle pour le détailler.", #rankResults, os.clock() - t0)
+		R.status.TextColor3 = C.Text
+	else
+		R.status.Text = "Scan interrompu."
+	end
+	rankScanning = false
+end
+
+-- ===================== PAGE REGLAGES =====================
+local pageSettings = pages.settings
+
+local function sectionTitle(order, text)
+	return lbl({
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 20),
+		Font = FONT_BOLD,
+		TextSize = 11,
+		TextColor3 = C.Muted,
+		Text = string.upper(text),
+		Parent = pageSettings,
+	})
+end
+
+local function settingRow(order, title, desc, rightW)
+	local row = make("Frame", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 58),
+		BackgroundColor3 = C.Row,
+		Parent = pageSettings,
+	}, { corner(10), stroke(C.Line, 0.5, 1) })
+	lbl({
+		Size = UDim2.new(1, -(rightW + 30), 0, 20),
+		Position = UDim2.fromOffset(14, 10),
+		Font = FONT_SEMI,
+		TextSize = 13,
+		Text = title,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = row,
+	})
+	lbl({
+		Size = UDim2.new(1, -(rightW + 30), 0, 16),
+		Position = UDim2.fromOffset(14, 32),
+		TextSize = 10,
+		TextColor3 = C.Muted,
+		Text = desc,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = row,
+	})
+	return row
+end
+
+local function addToggle(row, initial, cb)
+	local state = initial
+	local btn = make("TextButton", {
+		Size = UDim2.fromOffset(44, 24),
+		Position = UDim2.new(1, -14, 0.5, 0),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Text = "",
+		AutoButtonColor = false,
+		BackgroundColor3 = C.Line,
+		Parent = row,
+	}, { corner(12) })
+	local knob = make("Frame", {
+		Size = UDim2.fromOffset(18, 18),
+		Position = UDim2.new(0, 3, 0.5, 0),
+		AnchorPoint = Vector2.new(0, 0.5),
+		BackgroundColor3 = C.Text,
+		Parent = btn,
+	}, { corner(9) })
+	local function refresh()
+		btn.BackgroundColor3 = if state then C.Accent else C.Line
+		knob.Position = if state then UDim2.new(1, -21, 0.5, 0) else UDim2.new(0, 3, 0.5, 0)
+	end
+	bindAccent(refresh)
+	btn.MouseButton1Click:Connect(function()
+		state = not state
+		refresh()
+		cb(state)
+	end)
+end
+
+local function addStepper(row, getText, onMinus, onPlus)
+	local box = make("Frame", {
+		Size = UDim2.fromOffset(136, 32),
+		Position = UDim2.new(1, -14, 0.5, 0),
+		AnchorPoint = Vector2.new(1, 0.5),
+		BackgroundTransparency = 1,
+		Parent = row,
+	})
+	local val = lbl({
+		Size = UDim2.new(1, -64, 1, 0),
+		Position = UDim2.fromOffset(32, 0),
+		Font = FONT_SEMI,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Text = getText(),
+		Parent = box,
+	})
+	local function sb(text, x)
+		local b = make("TextButton", {
+			Size = UDim2.fromOffset(30, 30),
+			Position = UDim2.new(x, 0, 0.5, 0),
+			AnchorPoint = Vector2.new(x, 0.5),
+			BackgroundColor3 = C.Bg,
+			BackgroundTransparency = 0.3,
+			AutoButtonColor = false,
+			Font = FONT_BOLD,
+			TextSize = 16,
+			TextColor3 = C.Text,
+			Text = text,
+			Parent = box,
+		}, { corner(8), stroke(C.Line, 0.5, 1) })
+		hoverFx(b, function() return C.Bg end, rowHover)
+		return b
+	end
+	sb("-", 0).MouseButton1Click:Connect(function() onMinus(); val.Text = getText() end)
+	sb("+", 1).MouseButton1Click:Connect(function() onPlus(); val.Text = getText() end)
+end
+
+local function addSegmented(row, opts, get, set)
+	local w = 56
+	local box = make("Frame", {
+		Size = UDim2.fromOffset(#opts * w + (#opts - 1) * 4, 30),
+		Position = UDim2.new(1, -14, 0.5, 0),
+		AnchorPoint = Vector2.new(1, 0.5),
+		BackgroundTransparency = 1,
+		Parent = row,
+	}, { make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }) })
+	local btns = {}
+	local function refresh()
+		for i, b in ipairs(btns) do
+			local on = get() == i
+			b.BackgroundColor3 = if on then C.AccentBg else C.Bg
+			b.BackgroundTransparency = if on then 0.2 else 0.4
+			b.TextColor3 = if on then C.Accent else C.Muted
+		end
+	end
+	for i, name in ipairs(opts) do
+		btns[i] = make("TextButton", {
+			LayoutOrder = i,
+			Size = UDim2.fromOffset(w, 30),
+			AutoButtonColor = false,
+			Font = FONT_SEMI,
+			TextSize = 11,
+			Text = name,
+			BackgroundColor3 = C.Bg,
+			Parent = box,
+		}, { corner(8) })
+		btns[i].MouseButton1Click:Connect(function()
+			set(i)
+			refresh()
+		end)
+	end
+	bindAccent(refresh)
+end
+
+local function addActionRow(order, text, cb)
+	local b = make("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 40),
+		BackgroundColor3 = C.Row,
+		AutoButtonColor = false,
+		Font = FONT_SEMI,
+		TextSize = 13,
+		TextColor3 = C.Text,
+		Text = text,
+		Parent = pageSettings,
+	}, { corner(10), stroke(C.Line, 0.5, 1) })
+	hoverFx(b, rowBase, rowHover)
+	b.MouseButton1Click:Connect(cb)
+end
+
+local function setPanelOpacity()
+	panel.BackgroundTransparency = 1 - S.opacity
+	fpsBar.BackgroundTransparency = 1 - S.opacity
+end
+
+local order = 0
+local function nextOrder() order += 1 return order end
+
+sectionTitle(nextOrder(), "Interface")
+do
+	local r = settingRow(nextOrder(), "Taille de l'interface", "Agrandit ou réduit tout l'outil", 136)
+	addStepper(r,
+		function() return string.format("%d%%", math.round(S.uiMul * 100)) end,
+		function() S.uiMul = math.clamp(S.uiMul - 0.1, 0.6, 1.8); applyScale() end,
+		function() S.uiMul = math.clamp(S.uiMul + 0.1, 0.6, 1.8); applyScale() end)
+
+	r = settingRow(nextOrder(), "Opacité du fond", "Plus bas = plus transparent", 136)
+	addStepper(r,
+		function() return string.format("%d%%", math.round(S.opacity * 100)) end,
+		function() S.opacity = math.clamp(S.opacity - 0.1, 0.2, 1); setPanelOpacity() end,
+		function() S.opacity = math.clamp(S.opacity + 0.1, 0.2, 1); setPanelOpacity() end)
+
+	r = settingRow(nextOrder(), "Couleur d'accent", "Personnalise les boutons et surbrillances", 170)
+	local sw = make("Frame", {
+		Size = UDim2.fromOffset(#PALETTE * 24 + (#PALETTE - 1) * 6, 24),
+		Position = UDim2.new(1, -14, 0.5, 0),
+		AnchorPoint = Vector2.new(1, 0.5),
+		BackgroundTransparency = 1,
+		Parent = r,
+	}, { make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
+	local swBtns = {}
+	for i, col in ipairs(PALETTE) do
+		local b = make("TextButton", {
+			LayoutOrder = i,
+			Size = UDim2.fromOffset(24, 24),
+			BackgroundColor3 = col,
+			AutoButtonColor = false,
+			Text = "",
+			Parent = sw,
+		}, { corner(12) })
+		local st = stroke(C.Text, 1, 2)
+		st.Parent = b
+		swBtns[i] = { b = b, st = st, col = col }
+		b.MouseButton1Click:Connect(function()
+			setAccent(col)
+			for _, o in ipairs(swBtns) do o.st.Transparency = if o.col == col then 0 else 1 end
+		end)
+	end
+	swBtns[1].st.Transparency = 0
+
+	r = settingRow(nextOrder(), "Barre FPS compacte", "Masque le temps de frame et le mini-graphique", 60)
+	addToggle(r, S.compact, function(v) S.compact = v; applyCompact(); layoutPanel() end)
+end
+
+sectionTitle(nextOrder(), "Analyse")
+do
+	local r = settingRow(nextOrder(), "Sévérité des seuils", "Strict = plus d'avertissements, Souple = moins", 190)
+	addSegmented(r, SEV_NAMES, function() return S.severity end, function(i)
+		S.severity = i
+		if selected and lastScan then analyze(selected) end
+		toast("Sévérité : " .. SEV_NAMES[i], C.Accent)
+	end)
+
+	r = settingRow(nextOrder(), "Surligner au survol", "Contour pendant le ciblage 3D", 60)
+	addToggle(r, S.hoverHL, function(v) S.hoverHL = v; if isPicking then applyHover() end end)
+
+	r = settingRow(nextOrder(), "Surligner la sélection", "Contour blanc sur le modèle analysé", 60)
+	addToggle(r, S.selHL, function(v) S.selHL = v; updateSelectionHL() end)
+
+	r = settingRow(nextOrder(), "Ignorer les personnages", "Exclut les joueurs du ciblage et des scans", 60)
+	addToggle(r, S.ignorePlayers, function(v) S.ignorePlayers = v end)
+end
+
+sectionTitle(nextOrder(), "Profil")
+do
+	local r = settingRow(nextOrder(), "Alerte de FPS bas", "Contour rouge de la barre sous le seuil (2 s)", 60)
+	addToggle(r, S.alerts, function(v) S.alerts = v end)
+
+	r = settingRow(nextOrder(), "Seuil d'alerte", "FPS en dessous duquel l'alerte se déclenche", 136)
+	addStepper(r,
+		function() return S.alertFps .. " FPS" end,
+		function() S.alertFps = math.clamp(S.alertFps - 5, 10, 120) end,
+		function() S.alertFps = math.clamp(S.alertFps + 5, 10, 120) end)
+
+	local function qualityLevel()
+		local ok, v = pcall(function() return settings().Rendering.QualityLevel.Value end)
+		return if ok then v else 0
+	end
+	local function setQuality(n)
+		n = math.clamp(n, 1, 21)
+		local ok = pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel:FromValue(n) end)
+		if not ok then toast("Qualité non modifiable ici.", C.Warn) end
+	end
+	r = settingRow(nextOrder(), "Qualité graphique (test)", "Change le niveau local pour comparer les FPS", 136)
+	addStepper(r,
+		function() local q = qualityLevel(); return if q == 0 then "Auto" else tostring(q) end,
+		function() setQuality((if qualityLevel() == 0 then 10 else qualityLevel()) - 1) end,
+		function() setQuality((if qualityLevel() == 0 then 10 else qualityLevel()) + 1) end)
+end
+
+sectionTitle(nextOrder(), "Outils")
+addActionRow(nextOrder(), "Réinitialiser la position de la barre", function()
+	root.Position = UDim2.new(1, -20, 0, 64)
+	layoutPanel()
+	toast("Position réinitialisée", C.Good)
+end)
+addActionRow(nextOrder(), "Effacer les marqueurs 3D", function()
+	clearMarkers()
+	toast("Marqueurs effacés", C.Good)
+end)
+
+sectionTitle(nextOrder(), "Raccourcis")
+do
+	local card = make("Frame", {
+		LayoutOrder = nextOrder(),
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = C.Row,
+		Parent = pageSettings,
+	}, { corner(10), stroke(C.Line, 0.5, 1) })
+	local t = lbl({
+		Size = UDim2.new(1, -28, 0, 0),
+		Position = UDim2.fromOffset(14, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		RichText = true,
+		TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextSize = 12,
+		LineHeight = 1.4,
+		Text = "<b>F6</b>  ouvrir / fermer\n<b>F7</b>  ré-analyser la sélection\n<b>F8</b>  démarrer / arrêter l'enregistrement\n<b>Q / E</b>  niveau parent / enfant du modèle\n<b>Glisser</b>  la barre FPS ou l'en-tête pour déplacer",
+		Parent = card,
+	})
+	make("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12), Parent = t })
+end
+
+-- ===================== LAYOUT / ECHELLE / COMPACT =====================
+local function viewport()
+	local cam = Workspace.CurrentCamera
+	return if cam then cam.ViewportSize else Vector2.new(1280, 720)
+end
+
+layoutPanel = function()
+	local s = uiScale.Scale
+	local vp = viewport()
+	local top = root.AbsolutePosition.Y
+	local below = vp.Y - (top + BAR_H * s) - 16
+	local above = top - 16
+	local goBelow = below >= math.min(PANEL_H * s, above)
+	local space = if goBelow then below else above
+	local h = math.clamp(space / s - 8, 320, PANEL_H)
+	panel.Size = UDim2.fromOffset(PANEL_W, h)
+	if goBelow then
+		panel.AnchorPoint = Vector2.new(1, 0)
+		panel.Position = UDim2.new(1, 0, 0, BAR_H + 8)
+	else
+		panel.AnchorPoint = Vector2.new(1, 1)
+		panel.Position = UDim2.new(1, 0, 0, -8)
+	end
+end
+
+applyScale = function()
+	local vp = viewport()
+	local s = math.clamp(vp.Y / 900, 0.8, 1.35) * S.uiMul
+	if UIS.TouchEnabled and not UIS.KeyboardEnabled then s *= 1.1 end
+	s = math.max(0.5, math.min(s, (vp.X - 24) / PANEL_W))
+	uiScale.Scale = s
+	layoutPanel()
+end
+
+applyCompact = function()
+	fpsBar.Size = UDim2.fromOffset(if S.compact then 270 else BAR_W, BAR_H)
+	msLabel.Visible = not S.compact
+	spark.Visible = not S.compact
+end
+
+local function setRootTopRight(x, y)
+	local vp = viewport()
+	local w = root.AbsoluteSize.X
+	x = math.clamp(x, w + 4, vp.X - 4)
+	y = math.clamp(y, 4, math.max(4, vp.Y - BAR_H * uiScale.Scale - 4))
+	root.Position = UDim2.fromOffset(x, y)
+	layoutPanel()
+end
+
+-- ===================== TABS / PANEL =====================
+setTab = function(id)
+	currentTab = id
+	for tid, page in pairs(pages) do page.Visible = tid == id end
+	for _, d in ipairs(TAB_DEFS) do
+		if d.id == id then
+			headerTitle.Text = d.title
+			headerSub.Text = d.sub
+		end
+	end
+	refreshTabs()
+	if id == "system" then
+		updateGraph()
+		updateSystemStats()
+	elseif id == "live" then
+		updateLive()
+	end
+end
+
+refreshOpti = function()
+	optiBtn.BackgroundColor3 = if isPanelOpen then C.Accent else C.AccentBg
+	optiBtn.TextColor3 = if isPanelOpen then C.Bg else C.Accent
+	optiStroke.Color = C.Accent
+end
+bindAccent(refreshOpti)
+
+togglePanel = function(open)
+	local target = if open ~= nil then open else not isPanelOpen
+	isPanelOpen = target
+	if target then
+		panel.Visible = true
+		layoutPanel()
+		if not selected then setPicking(true) end
+	else
+		panel.Visible = false
+		setPicking(false)
+		clearMarkers()
+		if not testing then
+			restoreHidden()
+			updateActions()
+		end
+	end
+	refreshOpti()
+end
+
+-- ===================== EVENEMENTS UI =====================
+hoverFx(optiBtn, function() return if isPanelOpen then C.Accent else C.AccentBg end,
+function() return C.Accent:Lerp(C.Bg, if isPanelOpen then 0.1 else 0.55) end)
+optiBtn.MouseButton1Click:Connect(function() togglePanel() end)
+closeBtn.MouseButton1Click:Connect(function() togglePanel(false) end)
+
+B.pick.MouseButton1Click:Connect(function()
+	if testing then return end
+	setPicking(not isPicking)
+end)
+B.up.MouseButton1Click:Connect(function() stepLevel(1) end)
+B.down.MouseButton1Click:Connect(function() stepLevel(-1) end)
+B.world.MouseButton1Click:Connect(function()
+	if testing then return end
+	setPicking(false)
+	selChain = nil
+	updateNavButtons()
+	analyze(Workspace)
+end)
+
+B.test.MouseButton1Click:Connect(runImpactTest)
+B.hide.MouseButton1Click:Connect(function()
+	if testing then return end
+	if not selected or selected == Workspace then
+		toast("Sélectionnez d'abord un modèle précis.", C.Warn)
+		return
+	end
+	if hiddenState then restoreHidden() else applyHidden(selected) end
+	updateActions()
+end)
+B.report.MouseButton1Click:Connect(function()
+	if not lastScan then
+		toast("Analysez d'abord un modèle.", C.Warn)
+		return
+	end
+	local text = buildReport()
+	X.reportBox.Text = text
+	X.reportCard.Visible = not X.reportCard.Visible
+	if X.reportCard.Visible then print(text) end
+end)
+B.redo.MouseButton1Click:Connect(function()
+	if testing then return end
+	if selected then analyze(selected) else toast("Rien à ré-analyser.", C.Warn) end
+end)
+
+R.scan.MouseButton1Click:Connect(runRankScan)
+R.search:GetPropertyChangedSignal("Text"):Connect(renderRanking)
+R.sortScore.MouseButton1Click:Connect(function() rankSort = "score"; refreshRankSort(); renderRanking() end)
+R.sortParts.MouseButton1Click:Connect(function() rankSort = "parts"; refreshRankSort(); renderRanking() end)
+
+-- ===================== DRAG =====================
+local dragging, dragInput = false, nil
+local dragStart, startTR = Vector2.zero, Vector2.zero
+
+local function beginDrag(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragInput = input
+		dragStart = Vector2.new(input.Position.X, input.Position.Y)
+		startTR = Vector2.new(root.AbsolutePosition.X + root.AbsoluteSize.X, root.AbsolutePosition.Y)
+	end
+end
+fpsBar.InputBegan:Connect(beginDrag)
+header.InputBegan:Connect(beginDrag)
+
+G(UIS.InputChanged, function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input == dragInput) then
+		local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+		setRootTopRight(startTR.X + delta.X, startTR.Y + delta.Y)
+	end
+end)
+G(UIS.InputEnded, function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+		dragInput = nil
+	end
+end)
+
+-- ===================== ENTREES CLAVIER / PICK =====================
+G(UIS.InputBegan, function(input, gameProcessed)
+	if UIS:GetFocusedTextBox() then return end
+	if input.KeyCode == Enum.KeyCode.F6 then
+		togglePanel()
+		return
+	elseif input.KeyCode == Enum.KeyCode.F8 then
+		toggleRecord()
+		return
+	end
+	if gameProcessed then return end
+
+	if isPanelOpen then
+		if input.KeyCode == Enum.KeyCode.Q then
+			stepLevel(1)
+			return
+		elseif input.KeyCode == Enum.KeyCode.E then
+			stepLevel(-1)
+			return
+		elseif input.KeyCode == Enum.KeyCode.F7 then
+			if selected and not testing then analyze(selected) end
+			return
+		end
+	end
+
+	if isPicking and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+		local abs
+		if input.UserInputType == Enum.UserInputType.Touch then
+			abs = Vector2.new(input.Position.X, input.Position.Y) + GuiService:GetGuiInset()
+		else
+			abs = UIS:GetMouseLocation()
+		end
+		if not pointerOverUi(abs) then pickAt(abs) end
+	end
+end)
+
+-- ===================== BOUCLE FPS =====================
+local SAMPLE_DT = 0.5
+local frameCount, elapsed, hoverAcc = 0, 0, 0
+
+G(RunService.RenderStepped, function(dt)
+	frameCount += 1
+	elapsed += dt
+	if recording and #recData < 30000 then
+		recData[#recData + 1] = dt
+	end
+	if dt > 0.05 and os.clock() - sessionStart > 3 then
+		spikeCount += 1
+		table.insert(spikes, { t = os.clock() - sessionStart, ms = dt * 1000 })
+		if #spikes > 40 then table.remove(spikes, 1) end
+	end
+
+	if elapsed >= SAMPLE_DT then
+		local fps = frameCount / elapsed
+		local ms = (elapsed / frameCount) * 1000
+		fpsLabel.Text = string.format("%d FPS", math.round(fps))
+		msLabel.Text = string.format("%.1f ms", ms)
+		local col = fpsColor(fps)
+		statusDot.BackgroundColor3 = col
+		fpsLabel.TextColor3 = col
+
+		table.insert(history, fps)
+		if #history > HIST_MAX then table.remove(history, 1) end
+
+		if not S.compact then
+			for i = 1, SPARK_N do
+				local v = history[#history - SPARK_N + i]
+				local b = sparkBars[i]
+				if v then
+					b.Size = UDim2.new(1 / SPARK_N, -1, math.clamp(v / GRAPH_MAX, 0.05, 1), 0)
+					b.BackgroundColor3 = fpsColor(v)
+				end
+			end
+		end
+		if isPanelOpen and currentTab == "system" then
+			updateGraph()
+			updateSystemStats()
+		elseif isPanelOpen and currentTab == "live" then
+			updateLive()
+		end
+		if recording then
+			LV.recLabel.Text = string.format("<b>Enregistrement en cours…</b>  %s · %d frames", fmtTime(os.clock() - recStart), #recData)
+		end
+		if S.alerts and fps < S.alertFps then lowFpsTicks += 1 else lowFpsTicks = 0 end
+		local alerting = lowFpsTicks >= 4
+		fpsStroke.Color = if alerting then C.Bad else Color3.new(1, 1, 1)
+		fpsStroke.Transparency = if alerting then 0.1 else 0.9
+		if lowFpsTicks == 4 then
+			toast(string.format("Alerte : FPS sous %d", S.alertFps), C.Bad)
+		end
+		frameCount, elapsed = 0, 0
+	end
+
+	hoverAcc += dt
+	if isPicking and isPanelOpen and UIS.MouseEnabled and not testing and hoverAcc >= 0.04 then
+		hoverAcc = 0
+		local mouse = UIS:GetMouseLocation()
+		if not pointerOverUi(mouse) then
+			local chain = chainAt(mouse)
+			if chain then
+				local keep = hoveredModel and table.find(chain, hoveredModel)
+				hoverChain = chain
+				hoverIdx = keep or 1
+			else
+				hoverChain, hoverIdx = nil, 1
+			end
+			local nextModel = if hoverChain then hoverChain[hoverIdx] else nil
+			if nextModel ~= hoveredModel then applyHover() end
+		end
+	end
+end)
+
+-- ===================== INIT =====================
+setPanelOpacity()
+applyCompact()
+applyScale()
+setTab("model")
+refreshRankSort()
+
+local function hookCamera()
+	local cam = Workspace.CurrentCamera
+	if cam then cam:GetPropertyChangedSignal("ViewportSize"):Connect(applyScale) end
+end
+hookCamera()
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+	hookCamera()
+	applyScale()
+end)
+
+addInfoRow("Aucune analyse pour le moment. Ciblez un modèle, scannez tout le monde ou ouvrez l'onglet Top.", C.Muted, 1)
+setPicking(false)
+updateNavButtons()
+updateActions()
+
+gui.Destroying:Connect(function()
+	for _, c in ipairs(conns) do c:Disconnect() end
+	restoreHidden()
+	markersFolder:Destroy()
+	hlFolder:Destroy()
+end)
